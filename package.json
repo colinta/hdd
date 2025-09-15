@@ -1,5 +1,5 @@
 {
-  "name": "hdd",
+  "name": "hdd-viz",
   "main": ".dist/index.js",
   "license": "",
   "bin": {
