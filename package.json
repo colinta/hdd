@@ -8,6 +8,7 @@
     "hdd": ".dist/index.js"
   },
   "scripts": {
+    "prepublishOnly": "npm run build",
     "build": "node scripts/build.cjs",
     "start": "pnpm run build && node --enable-source-maps -- .dist/index.js",
     "clean": "rm -rf .dist/",
