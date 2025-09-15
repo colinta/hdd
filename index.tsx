@@ -1,3 +1,4 @@
+#!/usr/bin/env node
 import React, {useEffect, useState} from 'react';
 import {interceptConsoleLog, type Screen} from '@teaui/core';
 import {
