@@ -45,13 +45,15 @@ function App() {
       return;
     }
 
+    console.log('starting');
     const interval = setInterval(() => {
-      const progress = getProgress();
-      setProgress(progress);
-      setInProgress(!progress.isComplete);
+      const nextProgress = getProgress();
+      setProgress(nextProgress);
+      setInProgress(!nextProgress.isComplete);
 
       spin(i => i + 1);
-      if (progress.isComplete) {
+      if (nextProgress.isComplete) {
+        console.log('stopping');
         clearInterval(interval);
       }
     }, 100);
@@ -120,7 +122,7 @@ function App() {
         </Scrollable>
       </Stack.down>
       <Collapsible
-        isCollapsed
+        isCollapsed={false}
         collapsed={<Text>Show Console</Text>}
         expanded={<ConsoleLog height={10} />}
       />

@@ -13,6 +13,7 @@ export interface FileInfo {
 }
 
 interface FileInfoJob extends FileInfo {
+  refreshComplete(): void;
   setIsComplete(isComplete: boolean): void;
   isAborted: boolean;
 }
@@ -27,6 +28,7 @@ export function analyzeDiskUsage(rootPath: string): () => ProgressReport {
   let error: Error | null = null;
 
   async function scanDirectory(dirPath: string, cwdInfo: FileInfoJob): Promise<void> {
+    console.log({dirPath});
     cwdInfo.isAborted = false;
     cwdInfo.isComplete = false;
     cwdInfo.size = 0;
@@ -49,9 +51,12 @@ export function analyzeDiskUsage(rootPath: string): () => ProgressReport {
           isComplete: false,
           children: [],
           isAborted: false,
+          refreshComplete() {
+            dirInfo.setIsComplete(dirInfo.children.every(child => child.isComplete));
+          },
           setIsComplete(isComplete: boolean) {
             dirInfo.isComplete = isComplete;
-            cwdInfo.setIsComplete(isComplete);
+            cwdInfo.refreshComplete();
           },
           abort() {
             dirInfo.isAborted = true;
@@ -88,7 +93,7 @@ export function analyzeDiskUsage(rootPath: string): () => ProgressReport {
         fileMap.set(relPath, dirInfo);
 
         await dirInfo.refresh();
-        cwdInfo.children.push(dirInfo);
+        cwdInfo.children = [...cwdInfo.children, dirInfo];
         cwdInfo.size += dirInfo.size;
       } else if (entry.isFile()) {
         const stats = await fs.stat(fullPath);
@@ -100,9 +105,10 @@ export function analyzeDiskUsage(rootPath: string): () => ProgressReport {
           isComplete: true,
           children: [],
           isAborted: false,
+          refreshComplete() {},
           setIsComplete(isComplete: boolean) {
             fileInfo.isComplete = isComplete;
-            cwdInfo.setIsComplete(isComplete);
+            cwdInfo.refreshComplete();
           },
           abort() {
             fileInfo.isAborted = true;
@@ -130,7 +136,7 @@ export function analyzeDiskUsage(rootPath: string): () => ProgressReport {
         fileMap.set(relPath, fileInfo);
 
         cwdInfo.size += fileSize;
-        cwdInfo.children.push(fileInfo);
+        cwdInfo.children = [...cwdInfo.children, fileInfo];
       }
     });
 
@@ -151,6 +157,9 @@ export function analyzeDiskUsage(rootPath: string): () => ProgressReport {
     isComplete: false,
     children: [],
     isAborted: false,
+    refreshComplete() {
+      rootInfo.setIsComplete(rootInfo.children.every(child => child.isComplete));
+    },
     setIsComplete(isComplete: boolean) {
       rootInfo.isComplete = isComplete;
     },
