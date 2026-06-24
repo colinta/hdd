@@ -1,136 +1,139 @@
 #!/usr/bin/env node
 import React, {useEffect, useState} from 'react';
-import {interceptConsoleLog, type Screen} from '@teaui/core';
+import {type Screen} from '@teaui/core';
+import {Button, Separator, Scrollable, Stack, Space, Text, run} from '@teaui/react';
 import {
-  Button,
-  Collapsible,
-  ConsoleLog,
-  Separator,
-  Scrollable,
-  Stack,
-  Space,
-  Text,
-  run,
-} from '@teaui/react';
-import {analyzeDiskUsage, formatBytes, type ProgressReport, type FileInfo} from './disk-usage';
+  createDiskUsageScanner,
+  formatBytes,
+  type FileInfo,
+  type ProgressReport,
+} from './disk-usage';
 import {resolve} from 'path';
 
-interceptConsoleLog();
-
-const targetPath = process.argv[2] || resolve('./');
-const getProgress = analyzeDiskUsage(targetPath);
+const targetPath = resolve(process.argv[2] || './');
+const scanner = createDiskUsageScanner(targetPath);
 
 function App() {
+  const [spinner, spin] = useState(0);
+  const [topCount, setTopCount] = useState(10);
+  const [progress, setProgress] = useState<ProgressReport>(() => scanner.getReport());
+
+  function refreshReport() {
+    setProgress(scanner.getReport());
+  }
+
   function onExit() {
+    scanner.abort();
     screen?.exit();
   }
 
-  const [spinner, spin] = useState(0);
-  const [inProgress, setInProgress] = useState(true);
-  const [progress, setProgress] = useState<ProgressReport>({
-    children: [],
-    files: new Map(),
-    size: 0,
-    isComplete: false,
-    error: null,
-    path: '',
-    isDirectory: true,
-    async refresh() {},
-    recalculate() {},
-    abort() {},
-  });
-
   useEffect(() => {
-    if (!inProgress) {
-      return;
-    }
-
-    console.log('starting');
     const interval = setInterval(() => {
-      const nextProgress = getProgress();
-      setProgress(nextProgress);
-      setInProgress(!nextProgress.isComplete);
-
+      refreshReport();
       spin(i => i + 1);
-      if (nextProgress.isComplete) {
-        console.log('stopping');
-        clearInterval(interval);
-      }
     }, 100);
 
     return () => {
       clearInterval(interval);
     };
-  }, [inProgress]);
+  }, []);
 
-  const [max, setMax] = useState(1);
-  const sortedEntries: [string, FileInfo][] = Array.from(progress.files.entries())
+  const entries = Array.from(progress.files.entries()).filter(([path]) => path !== '.');
+  const largestDirectories = entries
     .filter(([, info]) => info.isDirectory)
     .sort(([, a], [, b]) => b.size - a.size)
-    .slice(0, max);
+    .slice(0, topCount);
+  const largestFiles = entries
+    .filter(([, info]) => !info.isDirectory)
+    .sort(([, a], [, b]) => b.size - a.size)
+    .slice(0, topCount);
 
   return (
     <Stack.down>
       <Stack.down flex={1}>
-        {progress.error ? <Text>{progress.error.toString()}</Text> : null}
         <Stack.right>
-          <Text flex={1} italic>
-            Analyzing disk usage for: {progress.isComplete ? targetPath : progress.path}
-          </Text>
-          <Button title="Exit" onClick={onExit} />
-        </Stack.right>
-        <Text italic>
-          Status:{' '}
-          {progress.isComplete ? 'Complete' : STATUS[spinner % STATUS.length] + 'In Progress...'}
-        </Text>
-        <Text italic>Total size: {formatBytes(progress.size)}</Text>
-        <Text italic>Files analyzed: {progress.files.size}</Text>
-        <Separator direction="horizontal" border="single" />
-        {sortedEntries.length ? (
-          <>
-            <Stack.right>
-              <Text>Top </Text>
-              <Button title="-" onClick={() => setMax(max => Math.max(1, max - 1))} />
-              <Text bold> {sortedEntries.length} </Text>
-              <Button title="+" onClick={() => setMax(max => max + 1)} />{' '}
-              <Text> largest items</Text>
-            </Stack.right>
-            <Entries entries={sortedEntries} />
-          </>
-        ) : null}
-        <Separator direction="horizontal" border="single" />
-        <Stack.right>
-          <Text italic>
-            {progress.path} {formatBytes(progress.size)}
+          <Text flex={1} bold>
+            Hard disk usage report: {targetPath}
           </Text>
           <Button
-            border="none"
-            title="🔄"
+            title="Rescan"
             onClick={() => {
-              progress.refresh();
-              setInProgress(true);
+              scanner.refresh();
+              refreshReport();
             }}
           />
+          {!progress.isComplete && !progress.isAborted ? (
+            <Button
+              title="Abort"
+              onClick={() => {
+                scanner.abort();
+                refreshReport();
+              }}
+            />
+          ) : null}
+          <Button title="Exit" onClick={onExit} />
         </Stack.right>
+
+        <Text italic>Status: {statusText(progress, spinner)}</Text>
+        <Text italic>Total disk usage: {formatBytes(progress.size)}</Text>
+        <Text italic>
+          Scanned: {progress.entriesScanned} entries ({progress.filesScanned} files,{' '}
+          {progress.directoriesScanned} directories)
+        </Text>
+        <Text italic>Elapsed: {formatElapsed(progress.elapsedMs)}</Text>
+        {progress.errors.length ? (
+          <Text>
+            Warnings: {progress.errors.length} unreadable entries. First warning:{' '}
+            {progress.errors[0]?.path}: {progress.errors[0]?.message}
+          </Text>
+        ) : null}
+
+        <Separator direction="horizontal" border="single" />
+
+        <Stack.right>
+          <Text>Top </Text>
+          <Button title="-" onClick={() => setTopCount(count => Math.max(1, count - 1))} />
+          <Text bold> {topCount} </Text>
+          <Button title="+" onClick={() => setTopCount(count => count + 1)} />
+          <Text> largest entries</Text>
+        </Stack.right>
+
+        <Stack.right>
+          <Stack.down flex={1}>
+            <Text bold>Largest directories</Text>
+            <Entries entries={largestDirectories} emptyLabel="No directories scanned yet." />
+          </Stack.down>
+          <Space width={4} />
+          <Stack.down flex={1}>
+            <Text bold>Largest files</Text>
+            <Entries entries={largestFiles} emptyLabel="No files scanned yet." />
+          </Stack.down>
+        </Stack.right>
+
+        <Separator direction="horizontal" border="single" />
+
+        <Text bold>
+          {progress.path} {formatBytes(progress.size)}
+        </Text>
         <Scrollable>
-          <Files
-            onRefresh={() => {
-              setInProgress(true);
-            }}
-            files={progress.children}
-          />
+          <Files files={progress.children} />
         </Scrollable>
       </Stack.down>
-      <Collapsible
-        isCollapsed={false}
-        collapsed={<Text>Show Console</Text>}
-        expanded={<ConsoleLog height={10} />}
-      />
     </Stack.down>
   );
 }
 
-function Entries({entries}: {entries: [string, FileInfo][]}) {
+function Entries({
+  entries,
+  emptyLabel,
+}: {
+  entries: [string, FileInfo][];
+  emptyLabel: string;
+}) {
+  if (!entries.length) {
+    return <Text italic>{emptyLabel}</Text>;
+  }
+
   return (
     <Stack.right>
       <Stack.down>
@@ -140,33 +143,37 @@ function Entries({entries}: {entries: [string, FileInfo][]}) {
           </Text>
         ))}
       </Stack.down>
-      <Stack.down>
+      <Stack.down flex={1}>
         {entries.map(([path, info]) => (
-          <Text key={path}>{path}</Text>
+          <Text key={path}>{displayPath(info)}</Text>
         ))}
       </Stack.down>
       <Stack.down>
-        {entries.map(([path, info]) => (
+        {entries.map(([path]) => (
           <Text key={path}> | </Text>
         ))}
       </Stack.down>
       <Stack.down>
         {entries.map(([path, info]) => (
-          <Text key={path}>{formatBytes(info.size).padEnd(12)}</Text>
+          <Text key={path}>{formatBytes(info.size).padStart(12)}</Text>
         ))}
       </Stack.down>
     </Stack.right>
   );
 }
 
-function Files({files, onRefresh}: {files: FileInfo[]; onRefresh: () => void}) {
-  const sorted: FileInfo[] = [...files].sort((a, b) => b.size - a.size);
+function Files({files}: {files: FileInfo[]}) {
+  const sorted: FileInfo[] = [...files].sort((a, b) => b.size - a.size || a.path.localeCompare(b.path));
   const [isExpanded, setExpanded] = useState<Map<string, boolean>>(new Map());
+
+  if (!sorted.length) {
+    return <Text italic>No entries scanned yet.</Text>;
+  }
 
   return (
     <Stack.down>
       {sorted.map(fileInfo => {
-        const summary = fileInfo.path + (fileInfo.isDirectory ? '/' : '');
+        const summary = displayPath(fileInfo) + (fileInfo.isDirectory ? '/' : '');
         const isDirExpanded = fileInfo.isDirectory && isExpanded.get(fileInfo.path);
 
         return (
@@ -177,9 +184,10 @@ function Files({files, onRefresh}: {files: FileInfo[]; onRefresh: () => void}) {
                   border="none"
                   title={(isDirExpanded ? '▾' : '▹') + ' ' + summary}
                   onClick={() =>
-                    setExpanded(info => {
-                      info.set(fileInfo.path, !info.get(fileInfo.path));
-                      return new Map(info);
+                    setExpanded(previous => {
+                      const next = new Map(previous);
+                      next.set(fileInfo.path, !next.get(fileInfo.path));
+                      return next;
                     })
                   }
                 />
@@ -187,20 +195,14 @@ function Files({files, onRefresh}: {files: FileInfo[]; onRefresh: () => void}) {
                 <Text>{'   ' + summary + ' '}</Text>
               )}
               <Text italic> {formatBytes(fileInfo.size)}</Text>
-              <Text> ({fileInfo.children.length})</Text>
-              <Button
-                border="none"
-                title="🔄"
-                onClick={() => {
-                  fileInfo.refresh();
-                  onRefresh();
-                }}
-              />
+              {fileInfo.isDirectory ? <Text> ({fileInfo.children.length})</Text> : null}
+              {!fileInfo.isComplete ? <Text> scanning…</Text> : null}
+              {fileInfo.error ? <Text> ⚠ {fileInfo.error.message}</Text> : null}
             </Stack.right>
             {isDirExpanded ? (
               <Stack.right>
                 <Space width={2} />
-                <Files onRefresh={onRefresh} files={fileInfo.children} />
+                <Files files={fileInfo.children} />
               </Stack.right>
             ) : null}
           </Stack.down>
@@ -208,6 +210,37 @@ function Files({files, onRefresh}: {files: FileInfo[]; onRefresh: () => void}) {
       })}
     </Stack.down>
   );
+}
+
+function displayPath(info: FileInfo): string {
+  return info.path || info.name;
+}
+
+function statusText(progress: ProgressReport, spinner: number): string {
+  if (progress.isAborted) {
+    return 'Aborted';
+  }
+
+  if (progress.isComplete) {
+    return 'Complete';
+  }
+
+  return `${STATUS[spinner % STATUS.length]}Scanning (${progress.pendingDirectories} directories open)…`;
+}
+
+function formatElapsed(ms: number): string {
+  if (ms < 1000) {
+    return `${ms} ms`;
+  }
+
+  const seconds = ms / 1000;
+  if (seconds < 60) {
+    return `${seconds.toFixed(1)}s`;
+  }
+
+  const minutes = Math.floor(seconds / 60);
+  const remainingSeconds = Math.floor(seconds % 60);
+  return `${minutes}m ${remainingSeconds}s`;
 }
 
 let screen: Screen | undefined;

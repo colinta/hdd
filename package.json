@@ -8,7 +8,7 @@
   },
   "scripts": {
     "build": "tsc",
-    "start": "npm run build && node --enable-source-maps -- .dist/index.js",
+    "start": "pnpm run build && node --enable-source-maps -- .dist/index.js",
     "clean": "rm -rf .dist/"
   },
   "dependencies": {
