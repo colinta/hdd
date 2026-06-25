@@ -51,6 +51,8 @@ interface MutableFileInfo {
   ownSize: number;
   isDirectory: boolean;
   isComplete: boolean;
+  entriesRead: boolean;
+  pendingChildren: number;
   error: Error | null;
   children: MutableFileInfo[];
   parent: MutableFileInfo | null;
@@ -100,6 +102,8 @@ export function createDiskUsageScanner(rootPath: string): DiskUsageScanner {
       ownSize: size,
       isDirectory,
       isComplete: !isDirectory,
+      entriesRead: !isDirectory,
+      pendingChildren: 0,
       error: null,
       children: [],
       parent,
@@ -247,20 +251,94 @@ export function createDiskUsageScanner(rootPath: string): DiskUsageScanner {
     }
   }
 
-  async function scanDirectory(run: ScanRun, directory: MutableFileInfo): Promise<void> {
-    throwIfAborted(run);
-    directory.isComplete = false;
-    run.pendingDirectories += 1;
+  async function scanDirectory(run: ScanRun, root: MutableFileInfo): Promise<void> {
+    const queue: MutableFileInfo[] = [root];
+    const waiters: (() => void)[] = [];
+    let remainingDirectories = 1;
 
-    try {
-      const dir = await fs.opendir(directory.absolutePath);
+    function enqueue(directory: MutableFileInfo): void {
+      remainingDirectories += 1;
+      queue.push(directory);
+      const waiter = waiters.shift();
+      if (waiter) {
+        waiter();
+      }
+    }
 
-      for await (const dirent of dir) {
-        throwIfAborted(run);
-        await scanDirent(run, directory, dirent.name);
+    function markMaybeComplete(directory: MutableFileInfo): void {
+      if (directory.isComplete || !directory.entriesRead || directory.pendingChildren > 0) {
+        return;
       }
 
       directory.isComplete = true;
+      if (directory.parent) {
+        directory.parent.pendingChildren = Math.max(0, directory.parent.pendingChildren - 1);
+        markMaybeComplete(directory.parent);
+      }
+    }
+
+    async function nextDirectory(): Promise<MutableFileInfo | null> {
+      while (!queue.length) {
+        throwIfAborted(run);
+        if (remainingDirectories === 0) {
+          return null;
+        }
+        await new Promise<void>(resolve => {
+          waiters.push(resolve);
+        });
+      }
+
+      return queue.pop() ?? null;
+    }
+
+    async function worker(): Promise<void> {
+      while (true) {
+        const directory = await nextDirectory();
+        if (!directory) {
+          return;
+        }
+
+        await scanDirectoryEntries(run, directory, enqueue, markMaybeComplete);
+        remainingDirectories -= 1;
+        if (remainingDirectories === 0) {
+          while (waiters.length) {
+            waiters.shift()?.();
+          }
+        }
+      }
+    }
+
+    const workerCount = 16;
+    await Promise.all(Array.from({length: workerCount}, () => worker()));
+  }
+
+  async function scanDirectoryEntries(
+    run: ScanRun,
+    directory: MutableFileInfo,
+    enqueue: (directory: MutableFileInfo) => void,
+    markMaybeComplete: (directory: MutableFileInfo) => void,
+  ): Promise<void> {
+    throwIfAborted(run);
+    directory.isComplete = false;
+    directory.entriesRead = false;
+    run.pendingDirectories += 1;
+
+    try {
+      const dirents = await fs.readdir(directory.absolutePath, {withFileTypes: true});
+
+      const batchSize = 64;
+      for (let index = 0; index < dirents.length; index += batchSize) {
+        throwIfAborted(run);
+        const end = Math.min(index + batchSize, dirents.length);
+        const batch: Promise<void>[] = [];
+        for (let batchIndex = index; batchIndex < end; batchIndex += 1) {
+          batch.push(scanDirent(run, directory, dirents[batchIndex].name, enqueue));
+        }
+        await Promise.all(batch);
+      }
+
+      directory.entriesRead = true;
+      markMaybeComplete(directory);
     } catch (caught) {
       if (isAbortError(caught)) {
         directory.isComplete = false;
@@ -269,7 +347,8 @@ export function createDiskUsageScanner(rootPath: string): DiskUsageScanner {
 
       const error = toError(caught);
       recordError(run, directory, error);
-      directory.isComplete = true;
+      directory.entriesRead = true;
+      markMaybeComplete(directory);
     } finally {
       run.pendingDirectories = Math.max(0, run.pendingDirectories - 1);
     }
@@ -279,6 +358,7 @@ export function createDiskUsageScanner(rootPath: string): DiskUsageScanner {
     run: ScanRun,
     parent: MutableFileInfo,
     entryName: string,
+    enqueue: (directory: MutableFileInfo) => void,
   ): Promise<void> {
     const absolutePath = join(parent.absolutePath, entryName);
 
@@ -305,8 +385,9 @@ export function createDiskUsageScanner(rootPath: string): DiskUsageScanner {
     addSizeToAncestors(parent, child.ownSize);
 
     if (child.isDirectory) {
+      parent.pendingChildren += 1;
       run.directoriesScanned += 1;
-      await scanDirectory(run, child);
+      enqueue(child);
     } else {
       run.filesScanned += 1;
       child.isComplete = true;
