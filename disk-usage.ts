@@ -40,6 +40,7 @@ export interface DiskUsageScanner {
   getReport(): ProgressReport;
   refresh(): Promise<void>;
   abort(): void;
+  wait(): Promise<ProgressReport>;
 }
 
 interface MutableFileInfo {
@@ -139,6 +140,12 @@ export function createDiskUsageScanner(rootPath: string): DiskUsageScanner {
     currentRun.isAborted = true;
     currentRun.completedAt = currentRun.completedAt ?? Date.now();
     currentRun.controller.abort();
+  }
+
+  async function waitForCurrentRun(): Promise<ProgressReport> {
+    const run = currentRun;
+    await run.done;
+    return getReport();
   }
 
   function getReport(): ProgressReport {
@@ -335,6 +342,7 @@ export function createDiskUsageScanner(rootPath: string): DiskUsageScanner {
     getReport,
     refresh: startScan,
     abort: abortScan,
+    wait: waitForCurrentRun,
   };
 }
 
@@ -384,6 +392,21 @@ function sizeOnDisk(stats: Stats): number {
   }
 
   return stats.size;
+}
+
+export function formatElapsed(ms: number): string {
+  if (ms < 1000) {
+    return `${ms} ms`;
+  }
+
+  const seconds = ms / 1000;
+  if (seconds < 60) {
+    return `${seconds.toFixed(1)}s`;
+  }
+
+  const minutes = Math.floor(seconds / 60);
+  const remainingSeconds = Math.floor(seconds % 60);
+  return `${minutes}m ${remainingSeconds}s`;
 }
 
 export function formatBytes(bytes: number): string {
