@@ -110,7 +110,7 @@ export function App({scanner, targetPath, onExit}: AppProps) {
           {progress.path} {formatBytes(progress.size)}
         </Text>
         <Scrollable>
-          <Files files={progress.children} />
+          <Files files={progress.children} onRefresh={refreshReport} />
         </Scrollable>
       </Stack.down>
     </Stack.down>
@@ -174,14 +174,14 @@ function Entries({
   );
 }
 
-function Files({files}: {files: FileInfo[]}) {
+function Files({files, onRefresh}: {files: FileInfo[]; onRefresh(): void}) {
   const sorted: FileInfo[] = [...files].sort(
     (a, b) => b.size - a.size || a.path.localeCompare(b.path),
   );
   const [isExpanded, setExpanded] = useState<Map<string, boolean>>(new Map());
 
   if (!sorted.length) {
-    return <Text italic>No entries scanned yet.</Text>;
+    return null;
   }
 
   return (
@@ -208,6 +208,26 @@ function Files({files}: {files: FileInfo[]}) {
               ) : (
                 <Text>{'   ' + summary + ' '}</Text>
               )}
+              {fileInfo.isDirectory ? (
+                <Button
+                  border="none"
+                  title="↻"
+                  onClick={() => {
+                    void fileInfo.refresh();
+                    onRefresh();
+                  }}
+                />
+              ) : null}
+              {fileInfo.isDirectory ? (
+                <Button
+                  border="none"
+                  title="Ⓘ"
+                  onClick={() => {
+                    fileInfo.ignore();
+                    onRefresh();
+                  }}
+                />
+              ) : null}
               <Text italic> {formatBytes(fileInfo.size)}</Text>
               {fileInfo.isDirectory ? <Text> ({fileInfo.children.length})</Text> : null}
               {!fileInfo.isComplete ? <Text> scanning…</Text> : null}
@@ -216,7 +236,7 @@ function Files({files}: {files: FileInfo[]}) {
             {isDirExpanded ? (
               <Stack.right>
                 <Space width={2} />
-                <Files files={fileInfo.children} />
+                <Files files={fileInfo.children} onRefresh={onRefresh} />
               </Stack.right>
             ) : null}
           </Stack.down>
