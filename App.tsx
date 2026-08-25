@@ -23,13 +23,12 @@ export function App({scanner, targetPath, onExit}: AppProps) {
   }
 
   useEffect(() => {
-    const interval = setInterval(() => {
+    const unsubscribe = scanner.subscribe(() => {
       setProgress(scanner.getReport());
-    }, 100);
-
-    return () => {
-      clearInterval(interval);
-    };
+    });
+    // Catch a scan update that may have completed between render and subscription.
+    setProgress(scanner.getReport());
+    return unsubscribe;
   }, [scanner]);
 
   const entries = Array.from(progress.files.entries()).filter(([path]) => path !== '.');

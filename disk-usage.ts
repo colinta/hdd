@@ -1,4 +1,4 @@
-import {promises as fs, type Stats} from 'fs';
+import {promises as fs, type Dir, type Stats} from 'fs';
 import {basename, isAbsolute, join, relative, resolve, sep} from 'path';
 
 export interface FileInfo {
@@ -39,6 +39,7 @@ export interface ProgressReport extends FileInfo {
 
 export interface DiskUsageScanner {
   getReport(): ProgressReport;
+  subscribe(listener: () => void): () => void;
   refresh(path?: string): Promise<void>;
   ignore(path: string): void;
   abort(): void;
@@ -50,6 +51,7 @@ interface MutableFileInfo {
   absolutePath: string;
   name: string;
   size: number;
+  committedSize: number;
   ownSize: number;
   isDirectory: boolean;
   isComplete: boolean;
@@ -58,23 +60,34 @@ interface MutableFileInfo {
   error: Error | null;
   children: MutableFileInfo[];
   parent: MutableFileInfo | null;
+  refresh(): Promise<void>;
+  recalculate(): void;
+  abort(): void;
+  ignore(): void;
 }
 
-interface ScanRun {
+interface ScanJob {
+  id: number;
   controller: AbortController;
   root: MutableFileInfo;
-  files: Map<string, MutableFileInfo>;
+  oldRoot: MutableFileInfo | null;
+  oldParent: MutableFileInfo | null;
+  oldIndex: number;
   errors: DiskUsageError[];
-  error: Error | null;
-  filesScanned: number;
-  directoriesScanned: number;
+  fatalError: Error | null;
+  rootWasDeleted: boolean;
   pendingDirectories: number;
-  isComplete: boolean;
-  isAborted: boolean;
   startedAt: number;
   completedAt: number | null;
   done: Promise<void>;
+  resolveDone: () => void;
+  isSettled: boolean;
 }
+
+type ScanTask =
+  | {type: 'stat'; absolutePath: string; parent: MutableFileInfo | null; node?: MutableFileInfo}
+  | {type: 'open'; node: MutableFileInfo}
+  | {type: 'read'; node: MutableFileInfo; directory: Dir};
 
 class TraversalAbortedError extends Error {
   constructor() {
@@ -83,126 +96,540 @@ class TraversalAbortedError extends Error {
   }
 }
 
+const IO_CONCURRENCY = 8;
+const NOTIFICATION_INTERVAL_MS = 50;
+
 export function createDiskUsageScanner(rootPath: string): DiskUsageScanner {
   const rootAbsolutePath = resolve(rootPath);
   const ignoredPaths = new Set<string>();
-  let currentRun = createRun();
+  const listeners = new Set<() => void>();
+  const files = new Map<string, MutableFileInfo>();
+  let visibleRoot = createMutableFileInfo(rootAbsolutePath, null, true);
+  let activeJob: ScanJob | null = null;
   let operationId = 0;
+  let refreshRequestId = 0;
+  let filesScanned = 0;
+  let directoriesScanned = 0;
+  let committedErrors: DiskUsageError[] = [];
+  let lastOperationErrors: DiskUsageError[] = [];
+  let isAborted = false;
+  let startedAt = Date.now();
+  let completedAt: number | null = null;
+  let notificationTimer: ReturnType<typeof setTimeout> | null = null;
+
+  addSubtreeToIndex(visibleRoot);
+  void startScan('.');
 
   function createMutableFileInfo(
     absolutePath: string,
     parent: MutableFileInfo | null,
     isDirectory: boolean,
-    stats?: Stats,
   ): MutableFileInfo {
-    const size = stats ? sizeOnDisk(stats) : 0;
-    const relativePath = parent ? relative(rootAbsolutePath, absolutePath) : rootAbsolutePath;
+    const relativePath = relative(rootAbsolutePath, absolutePath);
+    const path = parent ? relativePath || basename(absolutePath) : rootAbsolutePath;
 
-    return {
-      path: relativePath || basename(absolutePath) || absolutePath,
+    const info: MutableFileInfo = {
+      path,
       absolutePath,
       name: basename(absolutePath) || absolutePath,
-      size,
-      ownSize: size,
+      size: 0,
+      committedSize: 0,
+      ownSize: 0,
       isDirectory,
-      isComplete: !isDirectory,
-      entriesRead: !isDirectory,
+      isComplete: false,
+      entriesRead: false,
       pendingChildren: 0,
       error: null,
       children: [],
       parent,
+      refresh: () => refreshPath(absolutePath),
+      recalculate() {
+        // Sizes are updated incrementally by the active subtree scan.
+      },
+      abort: abortScan,
+      ignore: () => ignorePath(absolutePath),
     };
+
+    return info;
   }
 
-  function createRun(): ScanRun {
-    const controller = new AbortController();
-    const root = createMutableFileInfo(rootAbsolutePath, null, true);
-    const run: ScanRun = {
-      controller,
-      root,
-      files: new Map([['.', root]]),
-      errors: [],
-      error: null,
-      filesScanned: 0,
-      directoriesScanned: 0,
-      pendingDirectories: 0,
-      isComplete: false,
-      isAborted: false,
-      startedAt: Date.now(),
-      completedAt: null,
-      done: Promise.resolve(),
-    };
-    return run;
+  function subscribe(listener: () => void): () => void {
+    listeners.add(listener);
+    return () => listeners.delete(listener);
   }
 
-  function startScan(): Promise<void> {
-    operationId += 1;
-    currentRun.controller.abort();
-
-    const run = createRun();
-    currentRun = run;
-    run.done = scan(run);
-    return run.done;
-  }
-
-  function abortScan(): void {
-    currentRun.isAborted = true;
-    currentRun.completedAt = currentRun.completedAt ?? Date.now();
-    currentRun.controller.abort();
-  }
-
-  async function waitForCurrentRun(): Promise<ProgressReport> {
-    const run = currentRun;
-    await run.done;
-    return getReport();
-  }
-
-  async function refreshPath(path = '.'): Promise<void> {
-    const pathKey = normalizePathKey(path);
-    if (pathKey === '.') {
-      await startScan();
+  function scheduleNotification(): void {
+    if (notificationTimer) {
       return;
     }
 
-    const run = currentRun;
-    const previousDone = run.done;
-    const refreshOperationId = ++operationId;
+    notificationTimer = setTimeout(() => {
+      notificationTimer = null;
+      emitNow();
+    }, NOTIFICATION_INTERVAL_MS);
+    notificationTimer.unref?.();
+  }
 
-    if (!run.isComplete && !run.isAborted) {
-      abortScan();
+  function emitNow(): void {
+    if (notificationTimer) {
+      clearTimeout(notificationTimer);
+      notificationTimer = null;
     }
 
-    run.done = (async () => {
-      await previousDone;
-      if (refreshOperationId !== operationId || run !== currentRun) {
+    for (const listener of listeners) {
+      listener();
+    }
+  }
+
+  function createJob(root: MutableFileInfo, oldRoot: MutableFileInfo | null): ScanJob {
+    let resolveDone = () => {};
+    const done = new Promise<void>(resolve => {
+      resolveDone = resolve;
+    });
+
+    return {
+      id: ++operationId,
+      controller: new AbortController(),
+      root,
+      oldRoot,
+      oldParent: oldRoot?.parent ?? null,
+      oldIndex: oldRoot?.parent ? oldRoot.parent.children.indexOf(oldRoot) : -1,
+      errors: [],
+      fatalError: null,
+      rootWasDeleted: false,
+      pendingDirectories: 0,
+      startedAt: Date.now(),
+      completedAt: null,
+      done,
+      resolveDone,
+      isSettled: false,
+    };
+  }
+
+  async function startScan(pathKey: string): Promise<void> {
+    const requestId = ++refreshRequestId;
+    const previousJob = activeJob;
+    if (previousJob) {
+      cancelJob(previousJob, true);
+      await previousJob.done;
+    }
+
+    // Several refreshes can be requested while an old job is draining. Only the latest starts.
+    if (requestId !== refreshRequestId) {
+      return;
+    }
+
+    if (pathKey !== '.' && !files.has(pathKey)) {
+      const error = new Error(`Cannot refresh "${pathKey}": it is not in the current scan`);
+      lastOperationErrors = [makeErrorReport(pathKey, error)];
+      completedAt = Date.now();
+      emitNow();
+      return;
+    }
+
+    // A partial initial tree has no committed rollback point. Restart it from the root.
+    const requested = files.get(pathKey) ?? visibleRoot;
+    const oldRoot = requested.committedSize > 0 || requested.isComplete ? requested : null;
+    const scanPath = oldRoot ? pathKey : '.';
+    const replaced = oldRoot ?? visibleRoot;
+    const staging = createMutableFileInfo(replaced.absolutePath, replaced.parent, replaced.isDirectory);
+    const job = createJob(staging, oldRoot);
+
+    activeJob = job;
+    isAborted = false;
+    startedAt = job.startedAt;
+    completedAt = null;
+    lastOperationErrors = [];
+
+    attachStagingTree(job, replaced);
+    markAncestorsIncomplete(staging.parent);
+    emitNow();
+
+    runJob(job, scanPath).catch(caught => {
+      if (!isAbortError(caught)) {
+        job.fatalError = toError(caught);
+      }
+    });
+
+    await job.done;
+  }
+
+  function attachStagingTree(job: ScanJob, replaced: MutableFileInfo): void {
+    removeSubtreeFromIndex(replaced);
+
+    if (replaced.parent) {
+      const index = replaced.parent.children.indexOf(replaced);
+      job.oldIndex = index;
+      replaced.parent.children[index] = job.root;
+      job.root.parent = replaced.parent;
+      addSizeToAncestors(replaced.parent, -replaced.size);
+    } else {
+      visibleRoot = job.root;
+    }
+
+    addSubtreeToIndex(job.root);
+  }
+
+  async function runJob(job: ScanJob, pathKey: string): Promise<void> {
+    const tasks: ScanTask[] = [
+      {type: 'stat', absolutePath: job.root.absolutePath, parent: job.root.parent, node: job.root},
+    ];
+    const openDirectories = new Set<Dir>();
+    let taskIndex = 0;
+    let activeTasks = 0;
+
+    const enqueue = (task: ScanTask): void => {
+      if (!job.controller.signal.aborted && activeJob === job) {
+        tasks.push(task);
+      }
+    };
+
+    const finishIfIdle = async (): Promise<void> => {
+      if (job.isSettled || activeTasks !== 0 || taskIndex < tasks.length) {
         return;
       }
 
-      run.controller = new AbortController();
-      run.isAborted = false;
-      run.isComplete = false;
-      run.completedAt = null;
-      run.startedAt = Date.now();
-
-      try {
-        await refreshExistingPath(run, pathKey);
-        throwIfAborted(run);
-        run.isComplete = true;
-      } catch (caught) {
-        if (isAbortError(caught)) {
-          run.isAborted = true;
-        } else {
-          const error = toError(caught);
-          recordErrorAtPath(run, pathKey, error);
-          run.isComplete = true;
-        }
-      } finally {
-        run.pendingDirectories = Math.max(0, run.pendingDirectories);
-        run.completedAt = run.completedAt ?? Date.now();
+      for (const directory of openDirectories) {
+        await directory.close().catch(() => {});
       }
-    })();
+      openDirectories.clear();
+      settleJob(job, pathKey);
+    };
 
-    await run.done;
+    const pump = (): void => {
+      if (job.isSettled) {
+        return;
+      }
+
+      if (job.controller.signal.aborted || activeJob !== job) {
+        taskIndex = tasks.length;
+      }
+
+      while (
+        !job.controller.signal.aborted &&
+        activeJob === job &&
+        activeTasks < IO_CONCURRENCY &&
+        taskIndex < tasks.length
+      ) {
+        const task = tasks[taskIndex++];
+        activeTasks += 1;
+
+        executeTask(job, task, enqueue, openDirectories)
+          .catch(caught => {
+            if (!isAbortError(caught)) {
+              const error = toError(caught);
+              job.fatalError = job.fatalError ?? error;
+            }
+          })
+          .finally(() => {
+            activeTasks -= 1;
+            if (taskIndex > 1024 && taskIndex * 2 > tasks.length) {
+              tasks.splice(0, taskIndex);
+              taskIndex = 0;
+            }
+            pump();
+            void finishIfIdle();
+          });
+      }
+
+      void finishIfIdle();
+    };
+
+    const onAbort = (): void => {
+      taskIndex = tasks.length;
+      pump();
+    };
+    job.controller.signal.addEventListener('abort', onAbort, {once: true});
+    pump();
+    await job.done;
+    job.controller.signal.removeEventListener('abort', onAbort);
+  }
+
+  async function executeTask(
+    job: ScanJob,
+    task: ScanTask,
+    enqueue: (task: ScanTask) => void,
+    openDirectories: Set<Dir>,
+  ): Promise<void> {
+    throwIfJobInactive(job);
+
+    if (task.type === 'stat') {
+      await executeStatTask(job, task, enqueue);
+      return;
+    }
+
+    if (task.type === 'open') {
+      let directory: Dir | null = null;
+      try {
+        directory = await fs.opendir(task.node.absolutePath);
+        openDirectories.add(directory);
+        throwIfJobInactive(job);
+        enqueue({type: 'read', node: task.node, directory});
+      } catch (caught) {
+        if (directory) {
+          openDirectories.delete(directory);
+          await directory.close().catch(() => {});
+        }
+        if (isAbortError(caught)) {
+          throw caught;
+        }
+        const error = toError(caught);
+        if (task.node === job.root && job.oldParent && isNotFoundError(error)) {
+          job.rootWasDeleted = true;
+        } else {
+          recordError(job, task.node, error);
+        }
+        task.node.entriesRead = true;
+        job.pendingDirectories = Math.max(0, job.pendingDirectories - 1);
+        maybeCompleteNode(job, task.node);
+      }
+      return;
+    }
+
+    try {
+      const dirent = await task.directory.read();
+      throwIfJobInactive(job);
+
+      if (!dirent) {
+        openDirectories.delete(task.directory);
+        await task.directory.close().catch(() => {});
+        throwIfJobInactive(job);
+        task.node.entriesRead = true;
+        job.pendingDirectories = Math.max(0, job.pendingDirectories - 1);
+        maybeCompleteNode(job, task.node);
+        scheduleNotification();
+        return;
+      }
+
+      const absolutePath = join(task.node.absolutePath, dirent.name);
+      const childKey = pathKeyForAbsolutePath(absolutePath);
+      if (!ignoredPaths.has(childKey)) {
+        task.node.pendingChildren += 1;
+        enqueue({type: 'stat', absolutePath, parent: task.node});
+      }
+      enqueue(task);
+    } catch (caught) {
+      openDirectories.delete(task.directory);
+      await task.directory.close().catch(() => {});
+      if (isAbortError(caught)) {
+        throw caught;
+      }
+      const error = toError(caught);
+      if (task.node === job.root && job.oldParent && isNotFoundError(error)) {
+        job.rootWasDeleted = true;
+      } else {
+        recordError(job, task.node, error);
+      }
+      task.node.entriesRead = true;
+      job.pendingDirectories = Math.max(0, job.pendingDirectories - 1);
+      maybeCompleteNode(job, task.node);
+    }
+  }
+
+  async function executeStatTask(
+    job: ScanJob,
+    task: Extract<ScanTask, {type: 'stat'}>,
+    enqueue: (task: ScanTask) => void,
+  ): Promise<void> {
+    let stats: Stats;
+    try {
+      stats = await fs.lstat(task.absolutePath);
+      throwIfJobInactive(job);
+    } catch (caught) {
+      if (isAbortError(caught)) {
+        throw caught;
+      }
+
+      const error = toError(caught);
+      const pathKey = pathKeyForAbsolutePath(task.absolutePath);
+      if (task.node === job.root && job.oldParent && isNotFoundError(error)) {
+        job.rootWasDeleted = true;
+        task.node.isComplete = true;
+      } else {
+        recordErrorAtPath(job, pathKey, error);
+      }
+      if (task.node === job.root && !job.rootWasDeleted) {
+        job.fatalError = error;
+        task.node.error = error;
+        task.node.isComplete = true;
+      } else if (!task.node && task.parent) {
+        childFinished(job, task.parent);
+      }
+      return;
+    }
+
+    const isDirectory = stats.isDirectory();
+    const node = task.node ?? createMutableFileInfo(task.absolutePath, task.parent, isDirectory);
+    setNodeType(node, isDirectory);
+    node.ownSize = sizeOnDisk(stats);
+    node.size = node.ownSize;
+    node.entriesRead = !isDirectory;
+    node.isComplete = !isDirectory;
+    node.error = null;
+
+    if (!task.node && task.parent) {
+      task.parent.children.push(node);
+      addSubtreeToIndex(node);
+    }
+
+    addSizeToAncestors(node.parent, node.ownSize);
+
+    if (isDirectory) {
+      job.pendingDirectories += 1;
+      enqueue({type: 'open', node});
+    } else if (node !== job.root && node.parent) {
+      childFinished(job, node.parent);
+    }
+
+    scheduleNotification();
+  }
+
+  function maybeCompleteNode(job: ScanJob, node: MutableFileInfo): void {
+    if (node.isComplete || !node.entriesRead || node.pendingChildren !== 0) {
+      return;
+    }
+
+    node.isComplete = true;
+    if (node !== job.root && node.parent) {
+      childFinished(job, node.parent);
+    }
+  }
+
+  function childFinished(job: ScanJob, parent: MutableFileInfo): void {
+    parent.pendingChildren = Math.max(0, parent.pendingChildren - 1);
+    maybeCompleteNode(job, parent);
+  }
+
+  function settleJob(job: ScanJob, pathKey: string): void {
+    if (job.isSettled) {
+      return;
+    }
+    job.isSettled = true;
+    job.completedAt = Date.now();
+
+    const wasAborted = job.controller.signal.aborted || activeJob !== job;
+    if (wasAborted || (job.fatalError && job.oldRoot)) {
+      rollbackJob(job);
+      lastOperationErrors = job.fatalError ? [...job.errors] : [];
+    } else if (job.rootWasDeleted) {
+      commitDeletedJob(job, pathKey);
+    } else {
+      commitJob(job, pathKey);
+    }
+
+    if (activeJob === job) {
+      activeJob = null;
+      isAborted = wasAborted;
+      completedAt = job.completedAt;
+    }
+
+    job.resolveDone();
+    emitNow();
+  }
+
+  function commitJob(job: ScanJob, pathKey: string): void {
+    commitSubtreeSizes(job.root);
+    for (let ancestor = job.root.parent; ancestor; ancestor = ancestor.parent) {
+      ancestor.committedSize = ancestor.size;
+      ancestor.isComplete = true;
+    }
+
+    committedErrors = committedErrors.filter(
+      error => !isSameOrDescendantPath(error.path, pathKey),
+    );
+    committedErrors.push(...job.errors);
+    lastOperationErrors = [];
+  }
+
+  function commitDeletedJob(job: ScanJob, pathKey: string): void {
+    const parent = job.oldParent;
+    if (!parent) {
+      // The scanner root cannot be removed from a parent tree. Root failures remain errors.
+      rollbackJob(job);
+      return;
+    }
+
+    removeSubtreeFromIndex(job.root);
+    const index = parent.children.indexOf(job.root);
+    if (index >= 0) {
+      parent.children.splice(index, 1);
+    }
+    addSizeToAncestors(parent, -job.root.size);
+    restoreCommittedAncestors(parent);
+
+    committedErrors = committedErrors.filter(
+      error => !isSameOrDescendantPath(error.path, pathKey),
+    );
+    lastOperationErrors = [];
+  }
+
+  function rollbackJob(job: ScanJob): void {
+    if (!job.oldRoot) {
+      // An initial scan has no previous complete tree to restore. Keep its partial result visible.
+      return;
+    }
+
+    removeSubtreeFromIndex(job.root);
+    if (job.oldParent) {
+      const currentIndex = job.oldParent.children.indexOf(job.root);
+      const index = currentIndex >= 0 ? currentIndex : job.oldIndex;
+      job.oldParent.children[index] = job.oldRoot;
+      addSizeToAncestors(job.oldParent, job.oldRoot.size - job.root.size);
+      restoreCommittedAncestors(job.oldParent);
+    } else {
+      visibleRoot = job.oldRoot;
+    }
+    addSubtreeToIndex(job.oldRoot);
+  }
+
+  function cancelJob(job: ScanJob, rollbackImmediately: boolean): void {
+    if (job.isSettled) {
+      return;
+    }
+
+    job.controller.abort();
+    if (rollbackImmediately && job.oldRoot && activeJob === job) {
+      rollbackJob(job);
+      // Prevent settleJob from rolling the same tree back twice.
+      job.oldRoot = null;
+    }
+  }
+
+  function abortScan(): void {
+    refreshRequestId += 1;
+    const job = activeJob;
+    if (!job) {
+      return;
+    }
+
+    isAborted = true;
+    completedAt = Date.now();
+    cancelJob(job, true);
+    emitNow();
+  }
+
+  async function refreshPath(path = '.'): Promise<void> {
+    let pathKey: string;
+    try {
+      pathKey = normalizePathKey(path);
+    } catch (caught) {
+      lastOperationErrors = [makeErrorReport(path, toError(caught))];
+      emitNow();
+      return;
+    }
+
+    await startScan(pathKey);
+  }
+
+  async function waitForCurrentRun(): Promise<ProgressReport> {
+    while (activeJob) {
+      const job = activeJob;
+      await job.done;
+      if (activeJob === job) {
+        break;
+      }
+    }
+    return getReport();
   }
 
   function ignorePath(path: string): void {
@@ -212,12 +639,27 @@ export function createDiskUsageScanner(rootPath: string): DiskUsageScanner {
     }
 
     ignoredPaths.add(pathKey);
-
-    const run = currentRun;
-    const info = run.files.get(pathKey);
-    if (info) {
-      removeInfoFromTree(run, info);
+    refreshRequestId += 1;
+    if (activeJob) {
+      cancelJob(activeJob, true);
     }
+
+    const info = files.get(pathKey);
+    if (!info) {
+      emitNow();
+      return;
+    }
+
+    removeSubtreeFromIndex(info);
+    if (info.parent) {
+      info.parent.children = info.parent.children.filter(child => child !== info);
+      addSizeToAncestors(info.parent, -info.size);
+      restoreCommittedAncestors(info.parent);
+    }
+    committedErrors = committedErrors.filter(
+      error => !isSameOrDescendantPath(error.path, pathKey),
+    );
+    emitNow();
   }
 
   function normalizePathKey(path: string): string {
@@ -231,374 +673,139 @@ export function createDiskUsageScanner(rootPath: string): DiskUsageScanner {
     if (!relativePath) {
       return '.';
     }
-
     if (relativePath === '..' || relativePath.startsWith(`..${sep}`) || isAbsolute(relativePath)) {
       throw new Error(`Cannot refresh path outside scan root: ${path}`);
     }
-
     return relativePath;
   }
 
+  function pathKeyForAbsolutePath(absolutePath: string): string {
+    const relativePath = relative(rootAbsolutePath, absolutePath);
+    return relativePath || '.';
+  }
+
   function getReport(): ProgressReport {
-    const run = currentRun;
-    const snapshots = new Map<MutableFileInfo, FileInfo>();
-    const rootSnapshot = snapshotFileInfo(run.root, snapshots);
-    const fileSnapshots = new Map<string, FileInfo>();
+    const errors = [...committedErrors, ...lastOperationErrors];
+    if (activeJob) {
+      errors.push(...activeJob.errors);
+    }
+    const elapsedCompletedAt = completedAt;
 
-    let filesScanned = 0;
-    let directoriesScanned = 0;
+    return {
+      path: visibleRoot.path,
+      absolutePath: visibleRoot.absolutePath,
+      name: visibleRoot.name,
+      size: visibleRoot.size,
+      isDirectory: visibleRoot.isDirectory,
+      isComplete: !activeJob && visibleRoot.isComplete,
+      children: visibleRoot.children,
+      refresh: () => refreshPath('.'),
+      recalculate() {},
+      abort: abortScan,
+      ignore() {},
+      rootPath: rootAbsolutePath,
+      files: files as unknown as Map<string, FileInfo>,
+      errors,
+      error: errors.length ? new Error(errors[0].message) : null,
+      filesScanned,
+      directoriesScanned,
+      entriesScanned: filesScanned + directoriesScanned,
+      pendingDirectories: activeJob?.pendingDirectories ?? 0,
+      isAborted,
+      startedAt,
+      completedAt: elapsedCompletedAt,
+      elapsedMs: (elapsedCompletedAt ?? Date.now()) - startedAt,
+    };
+  }
 
-    for (const [path, info] of run.files) {
-      if (info.isDirectory) {
+  function setNodeType(node: MutableFileInfo, isDirectory: boolean): void {
+    if (node.isDirectory === isDirectory) {
+      return;
+    }
+
+    if (node.isDirectory) {
+      directoriesScanned -= 1;
+      filesScanned += 1;
+    } else {
+      filesScanned -= 1;
+      directoriesScanned += 1;
+    }
+    node.isDirectory = isDirectory;
+  }
+
+  function addSubtreeToIndex(node: MutableFileInfo): void {
+    const key = pathKeyForAbsolutePath(node.absolutePath);
+    if (!files.has(key)) {
+      if (node.isDirectory) {
         directoriesScanned += 1;
       } else {
         filesScanned += 1;
       }
-
-      fileSnapshots.set(path, snapshotFileInfo(info, snapshots));
     }
+    files.set(key, node);
+    for (const child of node.children) {
+      addSubtreeToIndex(child);
+    }
+  }
 
+  function removeSubtreeFromIndex(node: MutableFileInfo): void {
+    for (const child of node.children) {
+      removeSubtreeFromIndex(child);
+    }
+    const key = pathKeyForAbsolutePath(node.absolutePath);
+    if (files.get(key) === node) {
+      files.delete(key);
+      if (node.isDirectory) {
+        directoriesScanned = Math.max(0, directoriesScanned - 1);
+      } else {
+        filesScanned = Math.max(0, filesScanned - 1);
+      }
+    }
+  }
+
+  function addSizeToAncestors(node: MutableFileInfo | null, delta: number): void {
+    for (let current = node; current; current = current.parent) {
+      current.size += delta;
+      current.isComplete = false;
+    }
+  }
+
+  function restoreCommittedAncestors(node: MutableFileInfo | null): void {
+    for (let current = node; current; current = current.parent) {
+      current.committedSize = current.size;
+      current.isComplete = true;
+    }
+  }
+
+  function markAncestorsIncomplete(node: MutableFileInfo | null): void {
+    for (let current = node; current; current = current.parent) {
+      current.isComplete = false;
+    }
+  }
+
+  function commitSubtreeSizes(node: MutableFileInfo): void {
+    node.committedSize = node.size;
+    for (const child of node.children) {
+      commitSubtreeSizes(child);
+    }
+  }
+
+  function recordError(job: ScanJob, info: MutableFileInfo, error: Error): void {
+    info.error = error;
+    recordErrorAtPath(job, pathKeyForAbsolutePath(info.absolutePath), error);
+  }
+
+  function recordErrorAtPath(job: ScanJob, path: string, error: Error): void {
+    job.errors.push(makeErrorReport(path, error));
+  }
+
+  function makeErrorReport(path: string, error: Error): DiskUsageError {
+    const code = getErrorCode(error);
     return {
-      ...rootSnapshot,
-      rootPath: rootAbsolutePath,
-      files: fileSnapshots,
-      errors: [...run.errors],
-      error: run.error,
-      filesScanned,
-      directoriesScanned,
-      entriesScanned: filesScanned + directoriesScanned,
-      pendingDirectories: run.pendingDirectories,
-      isComplete: run.isComplete,
-      isAborted: run.isAborted,
-      startedAt: run.startedAt,
-      completedAt: run.completedAt,
-      elapsedMs: (run.completedAt ?? Date.now()) - run.startedAt,
-      refresh: () => refreshPath('.'),
-      abort: abortScan,
-      ignore: () => ignorePath('.'),
+      path: path || '.',
+      message: error.message,
+      ...(code ? {code} : {}),
     };
-  }
-
-  function snapshotFileInfo(
-    info: MutableFileInfo,
-    snapshots: Map<MutableFileInfo, FileInfo>,
-  ): FileInfo {
-    const existing = snapshots.get(info);
-    if (existing) {
-      return existing;
-    }
-
-    const snapshot: FileInfo = {
-      path: info.path,
-      absolutePath: info.absolutePath,
-      name: info.name,
-      size: info.size,
-      isDirectory: info.isDirectory,
-      isComplete: info.isComplete,
-      error: info.error,
-      children: [],
-      refresh: () => refreshPath(fileInfoKey(info)),
-      recalculate() {
-        // Sizes are maintained incrementally while the scan runs.
-      },
-      abort: abortScan,
-      ignore: () => ignorePath(fileInfoKey(info)),
-    };
-
-    snapshots.set(info, snapshot);
-    snapshot.children = info.children.map(child => snapshotFileInfo(child, snapshots));
-    return snapshot;
-  }
-
-  async function scan(run: ScanRun): Promise<void> {
-    try {
-      throwIfAborted(run);
-
-      const rootStats = await fs.lstat(rootAbsolutePath);
-      throwIfAborted(run);
-
-      run.root.isDirectory = rootStats.isDirectory();
-      run.root.ownSize = sizeOnDisk(rootStats);
-      run.root.size = run.root.ownSize;
-      run.root.isComplete = !run.root.isDirectory;
-
-      if (run.root.isDirectory) {
-        run.directoriesScanned = 1;
-        await scanDirectory(run, run.root);
-      } else {
-        run.filesScanned = 1;
-        run.root.isComplete = true;
-      }
-
-      throwIfAborted(run);
-      run.isComplete = true;
-      run.root.isComplete = true;
-    } catch (caught) {
-      if (isAbortError(caught)) {
-        run.isAborted = true;
-      } else {
-        const error = toError(caught);
-        run.error = error;
-        recordError(run, run.root, error);
-        run.root.isComplete = true;
-        run.isComplete = true;
-      }
-    } finally {
-      run.pendingDirectories = Math.max(0, run.pendingDirectories);
-      run.completedAt = run.completedAt ?? Date.now();
-    }
-  }
-
-  async function scanDirectory(
-    run: ScanRun,
-    root: MutableFileInfo,
-    completionBoundary: MutableFileInfo | null = null,
-  ): Promise<void> {
-    const queue: MutableFileInfo[] = [root];
-    const waiters: (() => void)[] = [];
-    let remainingDirectories = 1;
-
-    function enqueue(directory: MutableFileInfo): void {
-      remainingDirectories += 1;
-      queue.push(directory);
-      const waiter = waiters.shift();
-      if (waiter) {
-        waiter();
-      }
-    }
-
-    function markMaybeComplete(directory: MutableFileInfo): void {
-      if (directory.isComplete || !directory.entriesRead || directory.pendingChildren > 0) {
-        return;
-      }
-
-      directory.isComplete = true;
-      if (directory.parent && directory !== completionBoundary) {
-        directory.parent.pendingChildren = Math.max(0, directory.parent.pendingChildren - 1);
-        markMaybeComplete(directory.parent);
-      }
-    }
-
-    async function nextDirectory(): Promise<MutableFileInfo | null> {
-      while (!queue.length) {
-        throwIfAborted(run);
-        if (remainingDirectories === 0) {
-          return null;
-        }
-        await new Promise<void>(resolve => {
-          waiters.push(resolve);
-        });
-      }
-
-      return queue.pop() ?? null;
-    }
-
-    async function worker(): Promise<void> {
-      while (true) {
-        const directory = await nextDirectory();
-        if (!directory) {
-          return;
-        }
-
-        await scanDirectoryEntries(run, directory, enqueue, markMaybeComplete);
-        remainingDirectories -= 1;
-        if (remainingDirectories === 0) {
-          while (waiters.length) {
-            waiters.shift()?.();
-          }
-        }
-      }
-    }
-
-    const workerCount = 16;
-    await Promise.all(Array.from({length: workerCount}, () => worker()));
-  }
-
-  async function scanDirectoryEntries(
-    run: ScanRun,
-    directory: MutableFileInfo,
-    enqueue: (directory: MutableFileInfo) => void,
-    markMaybeComplete: (directory: MutableFileInfo) => void,
-  ): Promise<void> {
-    throwIfAborted(run);
-    directory.isComplete = false;
-    directory.entriesRead = false;
-    run.pendingDirectories += 1;
-
-    try {
-      const dirents = await fs.readdir(directory.absolutePath, {withFileTypes: true});
-
-      const batchSize = 64;
-      for (let index = 0; index < dirents.length; index += batchSize) {
-        throwIfAborted(run);
-        const end = Math.min(index + batchSize, dirents.length);
-        const batch: Promise<void>[] = [];
-        for (let batchIndex = index; batchIndex < end; batchIndex += 1) {
-          batch.push(scanDirent(run, directory, dirents[batchIndex].name, enqueue));
-        }
-        await Promise.all(batch);
-      }
-
-      directory.entriesRead = true;
-      markMaybeComplete(directory);
-    } catch (caught) {
-      if (isAbortError(caught)) {
-        directory.isComplete = false;
-        throw caught;
-      }
-
-      const error = toError(caught);
-      recordError(run, directory, error);
-      directory.entriesRead = true;
-      markMaybeComplete(directory);
-    } finally {
-      run.pendingDirectories = Math.max(0, run.pendingDirectories - 1);
-    }
-  }
-
-  async function scanDirent(
-    run: ScanRun,
-    parent: MutableFileInfo,
-    entryName: string,
-    enqueue: (directory: MutableFileInfo) => void,
-  ): Promise<void> {
-    const absolutePath = join(parent.absolutePath, entryName);
-
-    if (ignoredPaths.has(relative(rootAbsolutePath, absolutePath))) {
-      return;
-    }
-
-    let stats: Stats;
-    try {
-      stats = await fs.lstat(absolutePath);
-    } catch (caught) {
-      if (isAbortError(caught)) {
-        throw caught;
-      }
-      if (!isNotFoundError(caught)) {
-        recordErrorAtPath(run, relative(rootAbsolutePath, absolutePath), toError(caught));
-      }
-      return;
-    }
-
-    throwIfAborted(run);
-
-    const isDirectory = stats.isDirectory();
-    const child = createMutableFileInfo(absolutePath, parent, isDirectory, stats);
-    parent.children.push(child);
-    run.files.set(child.path, child);
-
-    addSizeToAncestors(parent, child.ownSize);
-
-    if (child.isDirectory) {
-      parent.pendingChildren += 1;
-      run.directoriesScanned += 1;
-      enqueue(child);
-    } else {
-      run.filesScanned += 1;
-      child.isComplete = true;
-    }
-  }
-
-  async function refreshExistingPath(run: ScanRun, pathKey: string): Promise<void> {
-    const info = run.files.get(pathKey);
-    if (!info) {
-      recordErrorAtPath(
-        run,
-        pathKey,
-        new Error(`Cannot refresh "${pathKey}": it is not in the current scan`),
-      );
-      return;
-    }
-
-    await refreshExistingInfo(run, info);
-  }
-
-  async function refreshExistingInfo(run: ScanRun, info: MutableFileInfo): Promise<void> {
-    throwIfAborted(run);
-
-    let stats: Stats;
-    try {
-      stats = await fs.lstat(info.absolutePath);
-    } catch (caught) {
-      if (isAbortError(caught)) {
-        throw caught;
-      }
-
-      if (isNotFoundError(caught)) {
-        removeInfoFromTree(run, info);
-        return;
-      }
-
-      const error = toError(caught);
-      removeErrorsForSubtree(run, info);
-      recordError(run, info, error);
-      info.isComplete = true;
-      return;
-    }
-
-    throwIfAborted(run);
-
-    const oldSize = info.size;
-    removeErrorsForSubtree(run, info);
-    removeDescendantsFromRun(run, info);
-
-    info.isDirectory = stats.isDirectory();
-    info.ownSize = sizeOnDisk(stats);
-    info.size = info.ownSize;
-    info.isComplete = !info.isDirectory;
-    info.entriesRead = !info.isDirectory;
-    info.pendingChildren = 0;
-    info.error = null;
-
-    addSizeToAncestors(info.parent, info.size - oldSize);
-
-    if (info.isDirectory) {
-      await scanDirectory(run, info, info);
-    } else {
-      info.isComplete = true;
-    }
-  }
-
-  function removeInfoFromTree(run: ScanRun, info: MutableFileInfo): void {
-    removeErrorsForSubtree(run, info);
-    addSizeToAncestors(info.parent, -info.size);
-
-    if (info.parent) {
-      info.parent.children = info.parent.children.filter(child => child !== info);
-      if (info.isDirectory && !info.isComplete) {
-        info.parent.pendingChildren = Math.max(0, info.parent.pendingChildren - 1);
-      }
-    }
-
-    removeInfoFromRun(run, info);
-  }
-
-  function removeDescendantsFromRun(run: ScanRun, info: MutableFileInfo): void {
-    for (const child of info.children) {
-      removeInfoFromRun(run, child);
-    }
-
-    info.children = [];
-  }
-
-  function removeInfoFromRun(run: ScanRun, info: MutableFileInfo): void {
-    for (const child of info.children) {
-      removeInfoFromRun(run, child);
-    }
-
-    run.files.delete(fileInfoKey(info));
-  }
-
-  function removeErrorsForSubtree(run: ScanRun, info: MutableFileInfo): void {
-    const pathKey = fileInfoKey(info);
-    run.errors = run.errors.filter(error => !isSameOrDescendantPath(error.path, pathKey));
-    run.error = run.errors.length ? new Error(run.errors[0].message) : null;
-    info.error = null;
-  }
-
-  function fileInfoKey(info: MutableFileInfo): string {
-    return info.parent ? info.path : '.';
   }
 
   function isSameOrDescendantPath(path: string, ancestor: string): boolean {
@@ -611,33 +818,15 @@ export function createDiskUsageScanner(rootPath: string): DiskUsageScanner {
     );
   }
 
-  function recordError(run: ScanRun, info: MutableFileInfo, error: Error): void {
-    info.error = error;
-    recordErrorAtPath(run, info.path, error);
-  }
-
-  function recordErrorAtPath(run: ScanRun, path: string, error: Error): void {
-    const code = getErrorCode(error);
-    const report: DiskUsageError = {
-      path: path || '.',
-      message: error.message,
-      ...(code ? {code} : {}),
-    };
-
-    run.errors.push(report);
-    run.error = run.error ?? error;
-  }
-
-  function addSizeToAncestors(info: MutableFileInfo | null, size: number): void {
-    for (let current: MutableFileInfo | null = info; current; current = current.parent) {
-      current.size += size;
+  function throwIfJobInactive(job: ScanJob): void {
+    if (job.controller.signal.aborted || activeJob !== job) {
+      throw new TraversalAbortedError();
     }
   }
 
-  startScan();
-
   return {
     getReport,
+    subscribe,
     refresh: refreshPath,
     ignore: ignorePath,
     abort: abortScan,
@@ -648,13 +837,6 @@ export function createDiskUsageScanner(rootPath: string): DiskUsageScanner {
 export function analyzeDiskUsage(rootPath: string): () => ProgressReport {
   const scanner = createDiskUsageScanner(rootPath);
   return scanner.getReport;
-}
-
-function throwIfAborted(run: ScanRun): void {
-  if (run.controller.signal.aborted) {
-    run.isAborted = true;
-    throw new TraversalAbortedError();
-  }
 }
 
 function isAbortError(caught: unknown): boolean {
@@ -670,7 +852,6 @@ function toError(caught: unknown): Error {
   if (caught instanceof Error) {
     return caught;
   }
-
   return new Error(String(caught));
 }
 
@@ -679,17 +860,14 @@ function getErrorCode(caught: unknown): string | undefined {
     const code = (caught as {code?: unknown}).code;
     return typeof code === 'string' ? code : undefined;
   }
-
   return undefined;
 }
 
 function sizeOnDisk(stats: Stats): number {
   const blocks = (stats as Stats & {blocks?: number}).blocks;
-
   if (typeof blocks === 'number' && Number.isFinite(blocks) && blocks >= 0) {
     return blocks * 512;
   }
-
   return stats.size;
 }
 
@@ -697,12 +875,10 @@ export function formatElapsed(ms: number): string {
   if (ms < 1000) {
     return `${ms} ms`;
   }
-
   const seconds = ms / 1000;
   if (seconds < 60) {
     return `${seconds.toFixed(1)}s`;
   }
-
   const minutes = Math.floor(seconds / 60);
   const remainingSeconds = Math.floor(seconds % 60);
   return `${minutes}m ${remainingSeconds}s`;
@@ -712,7 +888,6 @@ export function formatBytes(bytes: number): string {
   if (!Number.isFinite(bytes) || bytes === 0) {
     return '0 B';
   }
-
   const sign = bytes < 0 ? '-' : '';
   const absoluteBytes = Math.abs(bytes);
   const units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
@@ -722,6 +897,5 @@ export function formatBytes(bytes: number): string {
   );
   const size = absoluteBytes / Math.pow(1024, power);
   const decimals = power === 0 ? 0 : 2;
-
   return `${sign}${size.toFixed(decimals)} ${units[power]}`;
 }
