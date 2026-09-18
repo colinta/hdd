@@ -8,6 +8,7 @@ import {
   createDiskUsageScanner,
   formatBytes,
   formatElapsed,
+  largestDirectoryCandidates,
   type DiskUsageScanner,
   type FileInfo,
   type ProgressReport,
@@ -42,7 +43,7 @@ function parseCliArgs(args: string[]): CliOptions {
 
 async function printDiskUsageSummary(scanner: DiskUsageScanner): Promise<void> {
   const progress = await scanner.wait();
-  const largestDirectories = largestEntries(progress, true, 10);
+  const largestDirectories = largestDirectoryCandidates(progress, 10);
   const largestFiles = largestEntries(progress, false, 10);
   const status = progress.isAborted ? 'Aborted' : progress.isComplete ? 'Complete' : 'Incomplete';
   const lines = [

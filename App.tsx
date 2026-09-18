@@ -3,6 +3,7 @@ import {Button, Scrollable, Separator, Space, Spinner, Stack, Text} from '@teaui
 import {
   formatBytes,
   formatElapsed,
+  largestDirectoryCandidates,
   type DiskUsageScanner,
   type FileInfo,
   type ProgressReport,
@@ -32,10 +33,7 @@ export function App({scanner, targetPath, onExit}: AppProps) {
   }, [scanner]);
 
   const entries = Array.from(progress.files.entries()).filter(([path]) => path !== '.');
-  const largestDirectories = entries
-    .filter(([, info]) => info.isDirectory)
-    .sort(([, a], [, b]) => b.size - a.size)
-    .slice(0, topCount);
+  const largestDirectories = largestDirectoryCandidates(progress, topCount);
   const largestFiles = entries
     .filter(([, info]) => !info.isDirectory)
     .sort(([, a], [, b]) => b.size - a.size)

@@ -839,6 +839,39 @@ export function analyzeDiskUsage(rootPath: string): () => ProgressReport {
   return scanner.getReport;
 }
 
+/**
+ * Select directories by the space they account for beyond their largest child directory.
+ * This prevents a single large subtree from occupying the list once for every ancestor,
+ * while still allowing branching ancestors to rank for the other space they contain.
+ */
+export function largestDirectoryCandidates(
+  progress: ProgressReport,
+  count: number,
+): [string, FileInfo][] {
+  const ranked = Array.from(progress.files.entries())
+    .filter(([path, info]) => path !== '.' && info.isDirectory)
+    .map(([path, info]) => {
+      const largestChildSize = info.children.reduce(
+        (largest, child) => (child.isDirectory ? Math.max(largest, child.size) : largest),
+        0,
+      );
+      return {path, info, selectionSize: Math.max(0, info.size - largestChildSize)};
+    })
+    .filter(candidate => candidate.selectionSize > 0)
+    .sort(
+      (a, b) =>
+        b.selectionSize - a.selectionSize ||
+        b.info.size - a.info.size ||
+        a.path.localeCompare(b.path),
+    )
+    .slice(0, Math.max(0, count));
+
+  // Selection uses the non-redundant size, but the report remains ordered by total size.
+  return ranked
+    .sort((a, b) => b.info.size - a.info.size || a.path.localeCompare(b.path))
+    .map(({path, info}) => [path, info]);
+}
+
 function isAbortError(caught: unknown): boolean {
   return caught instanceof TraversalAbortedError || toError(caught).name === 'AbortError';
 }
