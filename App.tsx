@@ -185,12 +185,14 @@ function Files({files, onRefresh}: {files: FileInfo[]; onRefresh(): void}) {
 
   return (
     <Stack.down>
-      {sorted.map(fileInfo => {
+      {sorted.map((fileInfo, index) => {
         const summary = displayPath(fileInfo) + (fileInfo.isDirectory ? '/' : '');
         const isDirExpanded = fileInfo.isDirectory && isExpanded.get(fileInfo.path);
 
         return (
-          <Stack.down key={fileInfo.path}>
+          // TeaUI's renderer updates rows in place but does not reliably move keyed host nodes.
+          // Key by display position so each row receives the entry from the newly sorted array.
+          <Stack.down key={index}>
             <Stack.right>
               {fileInfo.isDirectory ? (
                 <Button
