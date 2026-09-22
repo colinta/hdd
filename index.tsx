@@ -13,7 +13,7 @@ import {
   type FileInfo,
   type ProgressReport,
 } from './disk-usage';
-import {fileLink} from './terminal-link';
+import {containingFolderLink, fileLink} from './terminal-link';
 
 interface CliOptions {
   printSummary: boolean;
@@ -103,7 +103,10 @@ function formatEntrySection(
   for (const [, info] of entries) {
     const suffix = info.isDirectory ? '/' : '';
     const title = `${displayPath(info)}${suffix}`;
-    lines.push(`  ${formatBytes(info.size).padStart(12)}  ${fileLink(info.absolutePath, title)}`);
+    const link = info.isDirectory
+      ? fileLink(info.absolutePath, title)
+      : containingFolderLink(info.absolutePath, title);
+    lines.push(`  ${formatBytes(info.size).padStart(12)}  ${link}`);
   }
 
   return lines;

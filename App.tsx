@@ -8,7 +8,7 @@ import {
   type FileInfo,
   type ProgressReport,
 } from './disk-usage';
-import {fileLink} from './terminal-link';
+import {containingFolderLink, fileLink} from './terminal-link';
 
 export interface AppProps {
   scanner: DiskUsageScanner;
@@ -157,7 +157,11 @@ function Entries({
       </Stack.down>
       <Stack.down flex={1}>
         {entries.map(([, info], index) => (
-          <Text key={index}>{fileLink(info.absolutePath, displayPath(info))}</Text>
+          <Text key={index}>
+            {info.isDirectory
+              ? fileLink(info.absolutePath, displayPath(info))
+              : containingFolderLink(info.absolutePath, displayPath(info))}
+          </Text>
         ))}
       </Stack.down>
       <Stack.down>

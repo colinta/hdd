@@ -1,5 +1,5 @@
 import {promises as fs, type Dir, type Stats} from 'fs';
-import {basename, isAbsolute, join, relative, resolve, sep} from 'path';
+import {basename, dirname, isAbsolute, join, relative, resolve, sep} from 'path';
 
 export interface FileInfo {
   path: string;
@@ -73,6 +73,9 @@ interface ScanJob {
   oldRoot: MutableFileInfo | null;
   oldParent: MutableFileInfo | null;
   oldIndex: number;
+  ancestorCompletion: Map<MutableFileInfo, boolean>;
+  refreshedRoots: Set<MutableFileInfo>;
+  enqueueTask: ((task: ScanTask) => void) | null;
   errors: DiskUsageError[];
   fatalError: Error | null;
   rootWasDeleted: boolean;
@@ -186,6 +189,10 @@ export function createDiskUsageScanner(rootPath: string): DiskUsageScanner {
     const done = new Promise<void>(resolve => {
       resolveDone = resolve;
     });
+    const ancestorCompletion = new Map<MutableFileInfo, boolean>();
+    for (let ancestor = root.parent; ancestor; ancestor = ancestor.parent) {
+      ancestorCompletion.set(ancestor, ancestor.isComplete);
+    }
 
     return {
       id: ++operationId,
@@ -194,6 +201,9 @@ export function createDiskUsageScanner(rootPath: string): DiskUsageScanner {
       oldRoot,
       oldParent: oldRoot?.parent ?? null,
       oldIndex: oldRoot?.parent ? oldRoot.parent.children.indexOf(oldRoot) : -1,
+      ancestorCompletion,
+      refreshedRoots: new Set(),
+      enqueueTask: null,
       errors: [],
       fatalError: null,
       rootWasDeleted: false,
@@ -206,9 +216,24 @@ export function createDiskUsageScanner(rootPath: string): DiskUsageScanner {
     };
   }
 
-  async function startScan(pathKey: string): Promise<void> {
+  async function startScan(requestedPathKey: string): Promise<void> {
     const requestId = ++refreshRequestId;
     const previousJob = activeJob;
+    let pathKey = existingPathOrParent(requestedPathKey);
+
+    if (previousJob && pathKey) {
+      const jobPath = pathKeyForAbsolutePath(previousJob.root.absolutePath);
+      if (
+        pathKey !== jobPath &&
+        isSameOrDescendantPath(pathKey, jobPath) &&
+        restartSubtreeInJob(previousJob, pathKey)
+      ) {
+        emitNow();
+        await previousJob.done;
+        return;
+      }
+    }
+
     if (previousJob) {
       cancelJob(previousJob, true);
       await previousJob.done;
@@ -219,17 +244,23 @@ export function createDiskUsageScanner(rootPath: string): DiskUsageScanner {
       return;
     }
 
-    if (pathKey !== '.' && !files.has(pathKey)) {
-      const error = new Error(`Cannot refresh "${pathKey}": it is not in the current scan`);
-      lastOperationErrors = [makeErrorReport(pathKey, error)];
+    pathKey = existingPathOrParent(requestedPathKey);
+    if (!pathKey) {
+      const error = new Error(
+        `Cannot refresh "${requestedPathKey}": it is not in the current scan`,
+      );
+      lastOperationErrors = [makeErrorReport(requestedPathKey, error)];
       completedAt = Date.now();
       emitNow();
       return;
     }
 
-    // A partial initial tree has no committed rollback point. Restart it from the root.
     const requested = files.get(pathKey) ?? visibleRoot;
-    const oldRoot = requested.committedSize > 0 || requested.isComplete ? requested : null;
+    // Keep a partial subtree as the rollback point for a targeted refresh. Falling back to the
+    // scanner root here makes a refresh button unexpectedly restart the entire tree.
+    const canReplaceRequested =
+      pathKey !== '.' || requested.committedSize > 0 || requested.isComplete;
+    const oldRoot = canReplaceRequested ? requested : null;
     const scanPath = oldRoot ? pathKey : '.';
     const replaced = oldRoot ?? visibleRoot;
     const staging = createMutableFileInfo(replaced.absolutePath, replaced.parent, replaced.isDirectory);
@@ -252,6 +283,61 @@ export function createDiskUsageScanner(rootPath: string): DiskUsageScanner {
     });
 
     await job.done;
+  }
+
+  function existingPathOrParent(pathKey: string): string | null {
+    if (pathKey === '.' || files.has(pathKey)) {
+      return pathKey;
+    }
+
+    // A stale row can outlive its entry (for example, when an in-flight parent scan is
+    // cancelled). Refresh its parent so the browser is reconciled with the filesystem.
+    const parentPathKey = pathKeyForAbsolutePath(dirname(resolve(rootAbsolutePath, pathKey)));
+    return parentPathKey !== pathKey && files.has(parentPathKey) ? parentPathKey : null;
+  }
+
+  function restartSubtreeInJob(job: ScanJob, pathKey: string): boolean {
+    const replaced = files.get(pathKey);
+    const parent = replaced?.parent;
+    if (!replaced || !parent || !job.enqueueTask || job.isSettled) {
+      return false;
+    }
+
+    const index = parent.children.indexOf(replaced);
+    if (index < 0) {
+      return false;
+    }
+
+    const wasComplete = replaced.isComplete;
+    job.pendingDirectories = Math.max(
+      0,
+      job.pendingDirectories - countPendingDirectories(replaced),
+    );
+    removeSubtreeFromIndex(replaced);
+
+    const staging = createMutableFileInfo(
+      replaced.absolutePath,
+      parent,
+      replaced.isDirectory,
+    );
+    parent.children[index] = staging;
+    addSizeToAncestors(parent, -replaced.size);
+    if (wasComplete) {
+      parent.pendingChildren += 1;
+    }
+    addSubtreeToIndex(staging);
+    job.refreshedRoots.add(staging);
+    job.errors = job.errors.filter(error => !isSameOrDescendantPath(error.path, pathKey));
+    lastOperationErrors = [];
+    isAborted = false;
+    completedAt = null;
+    job.enqueueTask({
+      type: 'stat',
+      absolutePath: staging.absolutePath,
+      parent,
+      node: staging,
+    });
+    return true;
   }
 
   function attachStagingTree(job: ScanJob, replaced: MutableFileInfo): void {
@@ -339,9 +425,14 @@ export function createDiskUsageScanner(rootPath: string): DiskUsageScanner {
       taskIndex = tasks.length;
       pump();
     };
+    job.enqueueTask = task => {
+      enqueue(task);
+      pump();
+    };
     job.controller.signal.addEventListener('abort', onAbort, {once: true});
     pump();
     await job.done;
+    job.enqueueTask = null;
     job.controller.signal.removeEventListener('abort', onAbort);
   }
 
@@ -351,7 +442,7 @@ export function createDiskUsageScanner(rootPath: string): DiskUsageScanner {
     enqueue: (task: ScanTask) => void,
     openDirectories: Set<Dir>,
   ): Promise<void> {
-    throwIfJobInactive(job);
+    throwIfNodeInactive(job, task.type === 'stat' ? task.node ?? task.parent : task.node);
 
     if (task.type === 'stat') {
       await executeStatTask(job, task, enqueue);
@@ -363,7 +454,7 @@ export function createDiskUsageScanner(rootPath: string): DiskUsageScanner {
       try {
         directory = await fs.opendir(task.node.absolutePath);
         openDirectories.add(directory);
-        throwIfJobInactive(job);
+        throwIfNodeInactive(job, task.node);
         enqueue({type: 'read', node: task.node, directory});
       } catch (caught) {
         if (directory) {
@@ -376,6 +467,9 @@ export function createDiskUsageScanner(rootPath: string): DiskUsageScanner {
         const error = toError(caught);
         if (task.node === job.root && job.oldParent && isNotFoundError(error)) {
           job.rootWasDeleted = true;
+        } else if (removeDeletedRefreshedRoot(job, task.node, error)) {
+          job.pendingDirectories = Math.max(0, job.pendingDirectories - 1);
+          return;
         } else {
           recordError(job, task.node, error);
         }
@@ -388,12 +482,12 @@ export function createDiskUsageScanner(rootPath: string): DiskUsageScanner {
 
     try {
       const dirent = await task.directory.read();
-      throwIfJobInactive(job);
+      throwIfNodeInactive(job, task.node);
 
       if (!dirent) {
         openDirectories.delete(task.directory);
         await task.directory.close().catch(() => {});
-        throwIfJobInactive(job);
+        throwIfNodeInactive(job, task.node);
         task.node.entriesRead = true;
         job.pendingDirectories = Math.max(0, job.pendingDirectories - 1);
         maybeCompleteNode(job, task.node);
@@ -417,6 +511,9 @@ export function createDiskUsageScanner(rootPath: string): DiskUsageScanner {
       const error = toError(caught);
       if (task.node === job.root && job.oldParent && isNotFoundError(error)) {
         job.rootWasDeleted = true;
+      } else if (removeDeletedRefreshedRoot(job, task.node, error)) {
+        job.pendingDirectories = Math.max(0, job.pendingDirectories - 1);
+        return;
       } else {
         recordError(job, task.node, error);
       }
@@ -434,7 +531,7 @@ export function createDiskUsageScanner(rootPath: string): DiskUsageScanner {
     let stats: Stats;
     try {
       stats = await fs.lstat(task.absolutePath);
-      throwIfJobInactive(job);
+      throwIfNodeInactive(job, task.node ?? task.parent);
     } catch (caught) {
       if (isAbortError(caught)) {
         throw caught;
@@ -445,6 +542,8 @@ export function createDiskUsageScanner(rootPath: string): DiskUsageScanner {
       if (task.node === job.root && job.oldParent && isNotFoundError(error)) {
         job.rootWasDeleted = true;
         task.node.isComplete = true;
+      } else if (task.node && removeDeletedRefreshedRoot(job, task.node, error)) {
+        return;
       } else {
         recordErrorAtPath(job, pathKey, error);
       }
@@ -454,6 +553,13 @@ export function createDiskUsageScanner(rootPath: string): DiskUsageScanner {
         task.node.isComplete = true;
       } else if (!task.node && task.parent) {
         childFinished(job, task.parent);
+      } else if (task.node && job.refreshedRoots.has(task.node)) {
+        task.node.error = error;
+        task.node.isComplete = true;
+        job.refreshedRoots.delete(task.node);
+        if (task.node.parent) {
+          childFinished(job, task.node.parent);
+        }
       }
       return;
     }
@@ -478,6 +584,7 @@ export function createDiskUsageScanner(rootPath: string): DiskUsageScanner {
       job.pendingDirectories += 1;
       enqueue({type: 'open', node});
     } else if (node !== job.root && node.parent) {
+      job.refreshedRoots.delete(node);
       childFinished(job, node.parent);
     }
 
@@ -490,9 +597,29 @@ export function createDiskUsageScanner(rootPath: string): DiskUsageScanner {
     }
 
     node.isComplete = true;
+    job.refreshedRoots.delete(node);
     if (node !== job.root && node.parent) {
       childFinished(job, node.parent);
     }
+  }
+
+  function removeDeletedRefreshedRoot(
+    job: ScanJob,
+    node: MutableFileInfo,
+    error: Error,
+  ): boolean {
+    const parent = node.parent;
+    if (!parent || !job.refreshedRoots.has(node) || !isNotFoundError(error)) {
+      return false;
+    }
+
+    removeSubtreeFromIndex(node);
+    parent.children = parent.children.filter(child => child !== node);
+    addSizeToAncestors(parent, -node.size);
+    job.refreshedRoots.delete(node);
+    childFinished(job, parent);
+    scheduleNotification();
+    return true;
   }
 
   function childFinished(job: ScanJob, parent: MutableFileInfo): void {
@@ -529,10 +656,7 @@ export function createDiskUsageScanner(rootPath: string): DiskUsageScanner {
 
   function commitJob(job: ScanJob, pathKey: string): void {
     commitSubtreeSizes(job.root);
-    for (let ancestor = job.root.parent; ancestor; ancestor = ancestor.parent) {
-      ancestor.committedSize = ancestor.size;
-      ancestor.isComplete = true;
-    }
+    restoreJobAncestors(job);
 
     committedErrors = committedErrors.filter(
       error => !isSameOrDescendantPath(error.path, pathKey),
@@ -555,7 +679,7 @@ export function createDiskUsageScanner(rootPath: string): DiskUsageScanner {
       parent.children.splice(index, 1);
     }
     addSizeToAncestors(parent, -job.root.size);
-    restoreCommittedAncestors(parent);
+    restoreJobAncestors(job);
 
     committedErrors = committedErrors.filter(
       error => !isSameOrDescendantPath(error.path, pathKey),
@@ -575,7 +699,7 @@ export function createDiskUsageScanner(rootPath: string): DiskUsageScanner {
       const index = currentIndex >= 0 ? currentIndex : job.oldIndex;
       job.oldParent.children[index] = job.oldRoot;
       addSizeToAncestors(job.oldParent, job.oldRoot.size - job.root.size);
-      restoreCommittedAncestors(job.oldParent);
+      restoreJobAncestors(job);
     } else {
       visibleRoot = job.oldRoot;
     }
@@ -770,10 +894,27 @@ export function createDiskUsageScanner(rootPath: string): DiskUsageScanner {
     }
   }
 
+  function countPendingDirectories(node: MutableFileInfo): number {
+    let count = node.isDirectory && !node.entriesRead ? 1 : 0;
+    for (const child of node.children) {
+      count += countPendingDirectories(child);
+    }
+    return count;
+  }
+
   function restoreCommittedAncestors(node: MutableFileInfo | null): void {
     for (let current = node; current; current = current.parent) {
       current.committedSize = current.size;
       current.isComplete = true;
+    }
+  }
+
+  function restoreJobAncestors(job: ScanJob): void {
+    for (const [ancestor, wasComplete] of job.ancestorCompletion) {
+      ancestor.isComplete = wasComplete;
+      if (wasComplete) {
+        ancestor.committedSize = ancestor.size;
+      }
     }
   }
 
@@ -820,6 +961,13 @@ export function createDiskUsageScanner(rootPath: string): DiskUsageScanner {
 
   function throwIfJobInactive(job: ScanJob): void {
     if (job.controller.signal.aborted || activeJob !== job) {
+      throw new TraversalAbortedError();
+    }
+  }
+
+  function throwIfNodeInactive(job: ScanJob, node: MutableFileInfo | null): void {
+    throwIfJobInactive(job);
+    if (node && files.get(pathKeyForAbsolutePath(node.absolutePath)) !== node) {
       throw new TraversalAbortedError();
     }
   }
