@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import React from 'react';
-import {type Screen} from '@teaui/core';
+import {type Screen, interceptConsoleLog} from '@teaui/core';
 import {run} from '@teaui/react';
 import {resolve} from 'path';
 import {App} from './App';
@@ -13,6 +13,7 @@ import {
   type FileInfo,
   type ProgressReport,
 } from './disk-usage';
+import {fileLink} from './terminal-link';
 
 interface CliOptions {
   printSummary: boolean;
@@ -101,7 +102,8 @@ function formatEntrySection(
 
   for (const [, info] of entries) {
     const suffix = info.isDirectory ? '/' : '';
-    lines.push(`  ${formatBytes(info.size).padStart(12)}  ${displayPath(info)}${suffix}`);
+    const title = `${displayPath(info)}${suffix}`;
+    lines.push(`  ${formatBytes(info.size).padStart(12)}  ${fileLink(info.absolutePath, title)}`);
   }
 
   return lines;
@@ -120,6 +122,7 @@ if (options.printSummary) {
   });
 } else {
   (async () => {
+    interceptConsoleLog()
     const [screen_] = await run(
       React.createElement(App, {
         scanner,

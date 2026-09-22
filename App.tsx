@@ -8,6 +8,7 @@ import {
   type FileInfo,
   type ProgressReport,
 } from './disk-usage';
+import {fileLink} from './terminal-link';
 
 export interface AppProps {
   scanner: DiskUsageScanner;
@@ -144,27 +145,29 @@ function Entries({
   }
 
   return (
+    // TeaUI does not reliably move keyed host nodes, so keep each rendered row keyed
+    // to its display position when the ranked entries are reordered.
     <Stack.right>
       <Stack.down>
-        {entries.map(([path], index) => (
-          <Text alignment="right" key={path}>
+        {entries.map((_, index) => (
+          <Text alignment="right" key={index}>
             {index + 1}.{' '}
           </Text>
         ))}
       </Stack.down>
       <Stack.down flex={1}>
-        {entries.map(([path, info]) => (
-          <Text key={path}>{displayPath(info)}</Text>
+        {entries.map(([, info], index) => (
+          <Text key={index}>{fileLink(info.absolutePath, displayPath(info))}</Text>
         ))}
       </Stack.down>
       <Stack.down>
-        {entries.map(([path]) => (
-          <Text key={path}> | </Text>
+        {entries.map((_, index) => (
+          <Text key={index}> | </Text>
         ))}
       </Stack.down>
       <Stack.down>
-        {entries.map(([path, info]) => (
-          <Text key={path}>{formatBytes(info.size).padStart(12)}</Text>
+        {entries.map(([, info], index) => (
+          <Text key={index}>{formatBytes(info.size).padStart(12)}</Text>
         ))}
       </Stack.down>
     </Stack.right>
