@@ -187,7 +187,7 @@ function Files({files, onRefresh}: {files: FileInfo[]; onRefresh(): void}) {
   return (
     <Stack.down>
       {sorted.map((fileInfo, index) => {
-        const summary = displayPath(fileInfo) + (fileInfo.isDirectory ? '/' : '');
+        const summary = fileInfo.name + (fileInfo.isDirectory ? '/' : '');
         const isDirExpanded = fileInfo.isDirectory && isExpanded.get(fileInfo.path);
 
         return (
@@ -198,7 +198,11 @@ function Files({files, onRefresh}: {files: FileInfo[]; onRefresh(): void}) {
               {fileInfo.isDirectory ? (
                 <Button
                   border="none"
-                  title={(isDirExpanded ? '▾' : '▹') + ' ' + summary}
+                  title={
+                    (isDirExpanded ? '▾' : '▹') +
+                    ' ' +
+                    fileLink(fileInfo.absolutePath, summary)
+                  }
                   onClick={() =>
                     setExpanded(previous => {
                       const next = new Map(previous);
@@ -208,7 +212,7 @@ function Files({files, onRefresh}: {files: FileInfo[]; onRefresh(): void}) {
                   }
                 />
               ) : (
-                <Text>{'   ' + summary + ' '}</Text>
+                <Text>{'   ' + fileLink(fileInfo.absolutePath, summary) + ' '}</Text>
               )}
               {fileInfo.isDirectory ? (
                 <Button
