@@ -203,10 +203,45 @@ function Entries({
 }
 
 function Files({files, onRefresh}: {files: FileInfo[]; onRefresh(): void}) {
+  // Expansion belongs to the whole browser, rather than to each recursively rendered level.
+  // Rows are keyed by position for TeaUI, so a size change can move a directory to another row;
+  // keeping the paths here prevents that move from remounting and collapsing its descendants.
+  const [expandedPaths, setExpandedPaths] = useState<Set<string>>(new Set());
+
+  return (
+    <FileRows
+      files={files}
+      expandedPaths={expandedPaths}
+      onToggle={path =>
+        setExpandedPaths(previous => {
+          const next = new Set(previous);
+          if (next.has(path)) {
+            next.delete(path);
+          } else {
+            next.add(path);
+          }
+          return next;
+        })
+      }
+      onRefresh={onRefresh}
+    />
+  );
+}
+
+function FileRows({
+  files,
+  expandedPaths,
+  onToggle,
+  onRefresh,
+}: {
+  files: FileInfo[];
+  expandedPaths: Set<string>;
+  onToggle(path: string): void;
+  onRefresh(): void;
+}) {
   const sorted: FileInfo[] = [...files].sort(
     (a, b) => b.size - a.size || a.path.localeCompare(b.path),
   );
-  const [isExpanded, setExpanded] = useState<Map<string, boolean>>(new Map());
 
   if (!sorted.length) {
     return null;
@@ -216,7 +251,7 @@ function Files({files, onRefresh}: {files: FileInfo[]; onRefresh(): void}) {
     <Stack.down>
       {sorted.map((fileInfo, index) => {
         const summary = fileInfo.name + (fileInfo.isDirectory ? '/' : '');
-        const isDirExpanded = fileInfo.isDirectory && isExpanded.get(fileInfo.path);
+        const isDirExpanded = fileInfo.isDirectory && expandedPaths.has(fileInfo.path);
 
         return (
           // TeaUI's renderer updates rows in place but does not reliably move keyed host nodes.
@@ -231,13 +266,7 @@ function Files({files, onRefresh}: {files: FileInfo[]; onRefresh(): void}) {
                     ' ' +
                     fileLink(fileInfo.absolutePath, summary)
                   }
-                  onClick={() =>
-                    setExpanded(previous => {
-                      const next = new Map(previous);
-                      next.set(fileInfo.path, !next.get(fileInfo.path));
-                      return next;
-                    })
-                  }
+                  onClick={() => onToggle(fileInfo.path)}
                 />
               ) : (
                 <Text>{'   ' + fileLink(fileInfo.absolutePath, summary) + ' '}</Text>
@@ -270,7 +299,12 @@ function Files({files, onRefresh}: {files: FileInfo[]; onRefresh(): void}) {
             {isDirExpanded ? (
               <Stack.right>
                 <Space width={2} />
-                <Files files={fileInfo.children} onRefresh={onRefresh} />
+                <FileRows
+                  files={fileInfo.children}
+                  expandedPaths={expandedPaths}
+                  onToggle={onToggle}
+                  onRefresh={onRefresh}
+                />
               </Stack.right>
             ) : null}
           </Stack.down>
