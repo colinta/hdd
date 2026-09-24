@@ -4,7 +4,7 @@ import {Button, Scrollable, Separator, Space, Spinner, Stack, Style, Text} from 
 import {
   formatBytes,
   formatElapsed,
-  largestDirectoryCandidates,
+  largestCandidates,
   type DiskUsageScanner,
   type FileInfo,
   type ProgressReport,
@@ -45,12 +45,10 @@ export function App({scanner, targetPath, onExit}: AppProps) {
     return unsubscribe;
   }, [scanner]);
 
-  const entries = Array.from(progress.files.entries()).filter(([path]) => path !== '.');
-  const largestDirectories = largestDirectoryCandidates(progress, topCount);
-  const largestFiles = entries
-    .filter(([, info]) => !info.isDirectory)
-    .sort(([, a], [, b]) => b.size - a.size)
-    .slice(0, topCount);
+  const {directories: largestDirectories, files: largestFiles} = largestCandidates(
+    progress,
+    topCount,
+  );
 
   return (
     <Stack.down>

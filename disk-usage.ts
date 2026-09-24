@@ -51,8 +51,6 @@ interface MutableFileInfo {
   absolutePath: string;
   name: string;
   size: number;
-  committedSize: number;
-  ownSize: number;
   isDirectory: boolean;
   isComplete: boolean;
   entriesRead: boolean;
@@ -88,7 +86,13 @@ interface ScanJob {
 }
 
 type ScanTask =
-  | {type: 'stat'; absolutePath: string; parent: MutableFileInfo | null; node?: MutableFileInfo}
+  | {
+      type: 'stat';
+      absolutePath: string;
+      pathKey: string;
+      parent: MutableFileInfo | null;
+      node?: MutableFileInfo;
+    }
   | {type: 'open'; node: MutableFileInfo}
   | {type: 'read'; node: MutableFileInfo; directory: Dir};
 
@@ -100,6 +104,7 @@ class TraversalAbortedError extends Error {
 }
 
 const IO_CONCURRENCY = 8;
+const MAX_OPEN_DIRECTORIES = 128;
 const NOTIFICATION_INTERVAL_MS = 50;
 
 export function createDiskUsageScanner(rootPath: string): DiskUsageScanner {
@@ -107,6 +112,173 @@ export function createDiskUsageScanner(rootPath: string): DiskUsageScanner {
   const ignoredPaths = new Set<string>();
   const listeners = new Set<() => void>();
   const files = new Map<string, MutableFileInfo>();
+
+  const emptyChildren: MutableFileInfo[] = [];
+
+  class MutableFileInfoNode implements MutableFileInfo {
+    size = 0;
+    isComplete = false;
+    entriesRead = false;
+    pendingChildren = 0;
+    error: Error | null = null;
+    children: MutableFileInfo[] = [];
+
+    constructor(
+      public path: string,
+      public isDirectory: boolean,
+      public parent: MutableFileInfo | null,
+    ) {}
+
+    get absolutePath(): string {
+      return this.parent ? join(rootAbsolutePath, this.path) : rootAbsolutePath;
+    }
+
+    get name(): string {
+      return basename(this.path);
+    }
+
+    refresh(): Promise<void> {
+      return refreshPath(this.absolutePath);
+    }
+
+    recalculate(): void {
+      // Sizes are updated incrementally by the active subtree scan.
+    }
+
+    abort(): void {
+      abortScan();
+    }
+
+    ignore(): void {
+      ignorePath(this.absolutePath);
+    }
+  }
+
+  class DirectoryInfoNode implements MutableFileInfo {
+    size = 0;
+    isComplete = false;
+    entriesRead = false;
+    pendingChildren = 0;
+
+    constructor(
+      public path: string,
+      public parent: MutableFileInfo,
+    ) {}
+
+    get absolutePath(): string {
+      return join(rootAbsolutePath, this.path);
+    }
+
+    get name(): string {
+      return basename(this.path);
+    }
+
+    get isDirectory(): boolean {
+      return true;
+    }
+
+    get children(): MutableFileInfo[] {
+      return emptyChildren;
+    }
+
+    set children(children: MutableFileInfo[]) {
+      if (children !== emptyChildren) {
+        Object.defineProperty(this, 'children', {
+          value: children,
+          writable: true,
+          configurable: true,
+        });
+      }
+    }
+
+    get error(): Error | null {
+      return null;
+    }
+
+    set error(error: Error | null) {
+      if (error) {
+        Object.defineProperty(this, 'error', {
+          value: error,
+          writable: true,
+          configurable: true,
+        });
+      }
+    }
+
+    refresh(): Promise<void> {
+      return refreshPath(this.absolutePath);
+    }
+
+    recalculate(): void {
+      // Sizes are updated incrementally by the active subtree scan.
+    }
+
+    abort(): void {
+      abortScan();
+    }
+
+    ignore(): void {
+      ignorePath(this.absolutePath);
+    }
+  }
+
+  class CompletedFileInfoNode implements MutableFileInfo {
+    constructor(
+      public path: string,
+      public size: number,
+    ) {}
+
+    get parent(): MutableFileInfo | null {
+      return files.get(dirname(this.path)) ?? null;
+    }
+
+    get absolutePath(): string {
+      return join(rootAbsolutePath, this.path);
+    }
+
+    get name(): string {
+      return basename(this.path);
+    }
+
+    get isDirectory(): boolean {
+      return false;
+    }
+
+    get isComplete(): boolean {
+      return true;
+    }
+
+    get entriesRead(): boolean {
+      return true;
+    }
+
+    get pendingChildren(): number {
+      return 0;
+    }
+
+    get error(): Error | null {
+      return null;
+    }
+
+    get children(): MutableFileInfo[] {
+      return emptyChildren;
+    }
+
+    refresh(): Promise<void> {
+      return refreshPath(this.absolutePath);
+    }
+
+    recalculate(): void {}
+
+    abort(): void {
+      abortScan();
+    }
+
+    ignore(): void {
+      ignorePath(this.absolutePath);
+    }
+  }
+
   let visibleRoot = createMutableFileInfo(rootAbsolutePath, null, true);
   let activeJob: ScanJob | null = null;
   let operationId = 0;
@@ -131,29 +303,7 @@ export function createDiskUsageScanner(rootPath: string): DiskUsageScanner {
     const relativePath = relative(rootAbsolutePath, absolutePath);
     const path = parent ? relativePath || basename(absolutePath) : rootAbsolutePath;
 
-    const info: MutableFileInfo = {
-      path,
-      absolutePath,
-      name: basename(absolutePath) || absolutePath,
-      size: 0,
-      committedSize: 0,
-      ownSize: 0,
-      isDirectory,
-      isComplete: false,
-      entriesRead: false,
-      pendingChildren: 0,
-      error: null,
-      children: [],
-      parent,
-      refresh: () => refreshPath(absolutePath),
-      recalculate() {
-        // Sizes are updated incrementally by the active subtree scan.
-      },
-      abort: abortScan,
-      ignore: () => ignorePath(absolutePath),
-    };
-
-    return info;
+    return new MutableFileInfoNode(path, isDirectory, parent);
   }
 
   function subscribe(listener: () => void): () => void {
@@ -222,7 +372,7 @@ export function createDiskUsageScanner(rootPath: string): DiskUsageScanner {
     let pathKey = existingPathOrParent(requestedPathKey);
 
     if (previousJob && pathKey) {
-      const jobPath = pathKeyForAbsolutePath(previousJob.root.absolutePath);
+      const jobPath = pathKeyForNode(previousJob.root);
       if (
         pathKey !== jobPath &&
         isSameOrDescendantPath(pathKey, jobPath) &&
@@ -258,8 +408,7 @@ export function createDiskUsageScanner(rootPath: string): DiskUsageScanner {
     const requested = files.get(pathKey) ?? visibleRoot;
     // Keep a partial subtree as the rollback point for a targeted refresh. Falling back to the
     // scanner root here makes a refresh button unexpectedly restart the entire tree.
-    const canReplaceRequested =
-      pathKey !== '.' || requested.committedSize > 0 || requested.isComplete;
+    const canReplaceRequested = pathKey !== '.' || requested.isComplete;
     const oldRoot = canReplaceRequested ? requested : null;
     const scanPath = oldRoot ? pathKey : '.';
     const replaced = oldRoot ?? visibleRoot;
@@ -334,6 +483,7 @@ export function createDiskUsageScanner(rootPath: string): DiskUsageScanner {
     job.enqueueTask({
       type: 'stat',
       absolutePath: staging.absolutePath,
+      pathKey,
       parent,
       node: staging,
     });
@@ -358,15 +508,32 @@ export function createDiskUsageScanner(rootPath: string): DiskUsageScanner {
 
   async function runJob(job: ScanJob, pathKey: string): Promise<void> {
     const tasks: ScanTask[] = [
-      {type: 'stat', absolutePath: job.root.absolutePath, parent: job.root.parent, node: job.root},
+      {
+        type: 'stat',
+        absolutePath: job.root.absolutePath,
+        pathKey,
+        parent: job.root.parent,
+        node: job.root,
+      },
     ];
     const openDirectories = new Set<Dir>();
+    const deferredOpenTasks: Extract<ScanTask, {type: 'open'}>[] = [];
     let taskIndex = 0;
     let activeTasks = 0;
 
     const enqueue = (task: ScanTask): void => {
       if (!job.controller.signal.aborted && activeJob === job) {
         tasks.push(task);
+      }
+    };
+
+    const releaseDirectory = (directory: Dir): void => {
+      openDirectories.delete(directory);
+      if (openDirectories.size < MAX_OPEN_DIRECTORIES) {
+        const deferred = deferredOpenTasks.pop();
+        if (deferred) {
+          enqueue(deferred);
+        }
       }
     };
 
@@ -400,7 +567,14 @@ export function createDiskUsageScanner(rootPath: string): DiskUsageScanner {
         const task = tasks[taskIndex++];
         activeTasks += 1;
 
-        executeTask(job, task, enqueue, openDirectories)
+        executeTask(
+          job,
+          task,
+          enqueue,
+          openDirectories,
+          deferredOpenTasks,
+          releaseDirectory,
+        )
           .catch(caught => {
             if (!isAbortError(caught)) {
               const error = toError(caught);
@@ -441,6 +615,8 @@ export function createDiskUsageScanner(rootPath: string): DiskUsageScanner {
     task: ScanTask,
     enqueue: (task: ScanTask) => void,
     openDirectories: Set<Dir>,
+    deferredOpenTasks: Extract<ScanTask, {type: 'open'}>[],
+    releaseDirectory: (directory: Dir) => void,
   ): Promise<void> {
     throwIfNodeInactive(job, task.type === 'stat' ? task.node ?? task.parent : task.node);
 
@@ -450,6 +626,11 @@ export function createDiskUsageScanner(rootPath: string): DiskUsageScanner {
     }
 
     if (task.type === 'open') {
+      if (openDirectories.size >= MAX_OPEN_DIRECTORIES) {
+        deferredOpenTasks.push(task);
+        return;
+      }
+
       let directory: Dir | null = null;
       try {
         directory = await fs.opendir(task.node.absolutePath);
@@ -458,7 +639,7 @@ export function createDiskUsageScanner(rootPath: string): DiskUsageScanner {
         enqueue({type: 'read', node: task.node, directory});
       } catch (caught) {
         if (directory) {
-          openDirectories.delete(directory);
+          releaseDirectory(directory);
           await directory.close().catch(() => {});
         }
         if (isAbortError(caught)) {
@@ -485,7 +666,7 @@ export function createDiskUsageScanner(rootPath: string): DiskUsageScanner {
       throwIfNodeInactive(job, task.node);
 
       if (!dirent) {
-        openDirectories.delete(task.directory);
+        releaseDirectory(task.directory);
         await task.directory.close().catch(() => {});
         throwIfNodeInactive(job, task.node);
         task.node.entriesRead = true;
@@ -495,15 +676,18 @@ export function createDiskUsageScanner(rootPath: string): DiskUsageScanner {
         return;
       }
 
-      const absolutePath = join(task.node.absolutePath, dirent.name);
+      const directoryPath = task.directory.path;
+      const absolutePath = directoryPath.endsWith(sep)
+        ? directoryPath + dirent.name
+        : directoryPath + sep + dirent.name;
       const childKey = pathKeyForAbsolutePath(absolutePath);
       if (!ignoredPaths.has(childKey)) {
         task.node.pendingChildren += 1;
-        enqueue({type: 'stat', absolutePath, parent: task.node});
+        enqueue({type: 'stat', absolutePath, pathKey: childKey, parent: task.node});
       }
       enqueue(task);
     } catch (caught) {
-      openDirectories.delete(task.directory);
+      releaseDirectory(task.directory);
       await task.directory.close().catch(() => {});
       if (isAbortError(caught)) {
         throw caught;
@@ -538,7 +722,7 @@ export function createDiskUsageScanner(rootPath: string): DiskUsageScanner {
       }
 
       const error = toError(caught);
-      const pathKey = pathKeyForAbsolutePath(task.absolutePath);
+      const pathKey = task.pathKey;
       if (task.node === job.root && job.oldParent && isNotFoundError(error)) {
         job.rootWasDeleted = true;
         task.node.isComplete = true;
@@ -565,27 +749,40 @@ export function createDiskUsageScanner(rootPath: string): DiskUsageScanner {
     }
 
     const isDirectory = stats.isDirectory();
-    const node = task.node ?? createMutableFileInfo(task.absolutePath, task.parent, isDirectory);
-    setNodeType(node, isDirectory);
-    node.ownSize = sizeOnDisk(stats);
-    node.size = node.ownSize;
-    node.entriesRead = !isDirectory;
-    node.isComplete = !isDirectory;
-    node.error = null;
+    const ownSize = sizeOnDisk(stats);
+    const node: MutableFileInfo =
+      task.node ??
+      (isDirectory
+        ? new DirectoryInfoNode(task.pathKey, task.parent!)
+        : new CompletedFileInfoNode(task.pathKey, ownSize));
 
-    if (!task.node && task.parent) {
-      task.parent.children.push(node);
+    if (task.node) {
+      setNodeType(node, isDirectory);
+      node.size = ownSize;
+      node.entriesRead = !isDirectory;
+      node.isComplete = !isDirectory;
+      node.error = null;
+    } else if (isDirectory) {
+      node.size = ownSize;
+    }
+
+    const parent = task.node ? node.parent : task.parent;
+    if (!task.node && parent) {
+      if (parent.children === emptyChildren) {
+        parent.children = [];
+      }
+      parent.children.push(node);
       addSubtreeToIndex(node);
     }
 
-    addSizeToAncestors(node.parent, node.ownSize);
+    addSizeToAncestors(parent, ownSize);
 
     if (isDirectory) {
       job.pendingDirectories += 1;
       enqueue({type: 'open', node});
-    } else if (node !== job.root && node.parent) {
+    } else if (node !== job.root && parent) {
       job.refreshedRoots.delete(node);
-      childFinished(job, node.parent);
+      childFinished(job, parent);
     }
 
     scheduleNotification();
@@ -596,6 +793,7 @@ export function createDiskUsageScanner(rootPath: string): DiskUsageScanner {
       return;
     }
 
+    node.children = node.children.length ? node.children.slice() : emptyChildren;
     node.isComplete = true;
     job.refreshedRoots.delete(node);
     if (node !== job.root && node.parent) {
@@ -655,7 +853,6 @@ export function createDiskUsageScanner(rootPath: string): DiskUsageScanner {
   }
 
   function commitJob(job: ScanJob, pathKey: string): void {
-    commitSubtreeSizes(job.root);
     restoreJobAncestors(job);
 
     committedErrors = committedErrors.filter(
@@ -778,7 +975,7 @@ export function createDiskUsageScanner(rootPath: string): DiskUsageScanner {
     if (info.parent) {
       info.parent.children = info.parent.children.filter(child => child !== info);
       addSizeToAncestors(info.parent, -info.size);
-      restoreCommittedAncestors(info.parent);
+      restoreCompleteAncestors(info.parent);
     }
     committedErrors = committedErrors.filter(
       error => !isSameOrDescendantPath(error.path, pathKey),
@@ -806,6 +1003,10 @@ export function createDiskUsageScanner(rootPath: string): DiskUsageScanner {
   function pathKeyForAbsolutePath(absolutePath: string): string {
     const relativePath = relative(rootAbsolutePath, absolutePath);
     return relativePath || '.';
+  }
+
+  function pathKeyForNode(node: MutableFileInfo): string {
+    return node.path === rootAbsolutePath ? '.' : node.path;
   }
 
   function getReport(): ProgressReport {
@@ -858,7 +1059,7 @@ export function createDiskUsageScanner(rootPath: string): DiskUsageScanner {
   }
 
   function addSubtreeToIndex(node: MutableFileInfo): void {
-    const key = pathKeyForAbsolutePath(node.absolutePath);
+    const key = pathKeyForNode(node);
     if (!files.has(key)) {
       if (node.isDirectory) {
         directoriesScanned += 1;
@@ -876,7 +1077,7 @@ export function createDiskUsageScanner(rootPath: string): DiskUsageScanner {
     for (const child of node.children) {
       removeSubtreeFromIndex(child);
     }
-    const key = pathKeyForAbsolutePath(node.absolutePath);
+    const key = pathKeyForNode(node);
     if (files.get(key) === node) {
       files.delete(key);
       if (node.isDirectory) {
@@ -902,9 +1103,8 @@ export function createDiskUsageScanner(rootPath: string): DiskUsageScanner {
     return count;
   }
 
-  function restoreCommittedAncestors(node: MutableFileInfo | null): void {
+  function restoreCompleteAncestors(node: MutableFileInfo | null): void {
     for (let current = node; current; current = current.parent) {
-      current.committedSize = current.size;
       current.isComplete = true;
     }
   }
@@ -912,9 +1112,6 @@ export function createDiskUsageScanner(rootPath: string): DiskUsageScanner {
   function restoreJobAncestors(job: ScanJob): void {
     for (const [ancestor, wasComplete] of job.ancestorCompletion) {
       ancestor.isComplete = wasComplete;
-      if (wasComplete) {
-        ancestor.committedSize = ancestor.size;
-      }
     }
   }
 
@@ -924,16 +1121,9 @@ export function createDiskUsageScanner(rootPath: string): DiskUsageScanner {
     }
   }
 
-  function commitSubtreeSizes(node: MutableFileInfo): void {
-    node.committedSize = node.size;
-    for (const child of node.children) {
-      commitSubtreeSizes(child);
-    }
-  }
-
   function recordError(job: ScanJob, info: MutableFileInfo, error: Error): void {
     info.error = error;
-    recordErrorAtPath(job, pathKeyForAbsolutePath(info.absolutePath), error);
+    recordErrorAtPath(job, pathKeyForNode(info), error);
   }
 
   function recordErrorAtPath(job: ScanJob, path: string, error: Error): void {
@@ -967,7 +1157,7 @@ export function createDiskUsageScanner(rootPath: string): DiskUsageScanner {
 
   function throwIfNodeInactive(job: ScanJob, node: MutableFileInfo | null): void {
     throwIfJobInactive(job);
-    if (node && files.get(pathKeyForAbsolutePath(node.absolutePath)) !== node) {
+    if (node && files.get(pathKeyForNode(node)) !== node) {
       throw new TraversalAbortedError();
     }
   }
@@ -992,32 +1182,148 @@ export function analyzeDiskUsage(rootPath: string): () => ProgressReport {
  * This prevents a single large subtree from occupying the list once for every ancestor,
  * while still allowing branching ancestors to rank for the other space they contain.
  */
+export interface LargestCandidates {
+  directories: [string, FileInfo][];
+  files: [string, FileInfo][];
+}
+
+export function largestCandidates(
+  progress: ProgressReport,
+  count: number,
+): LargestCandidates {
+  return selectLargestCandidates(progress, count, true, true);
+}
+
 export function largestDirectoryCandidates(
   progress: ProgressReport,
   count: number,
 ): [string, FileInfo][] {
-  const ranked = Array.from(progress.files.entries())
-    .filter(([path, info]) => path !== '.' && info.isDirectory)
-    .map(([path, info]) => {
-      const largestChildSize = info.children.reduce(
-        (largest, child) => (child.isDirectory ? Math.max(largest, child.size) : largest),
-        0,
-      );
-      return {path, info, selectionSize: Math.max(0, info.size - largestChildSize)};
-    })
-    .filter(candidate => candidate.selectionSize > 0)
-    .sort(
-      (a, b) =>
-        b.selectionSize - a.selectionSize ||
-        b.info.size - a.info.size ||
-        a.path.localeCompare(b.path),
-    )
-    .slice(0, Math.max(0, count));
+  return selectLargestCandidates(progress, count, true, false).directories;
+}
 
-  // Selection uses the non-redundant size, but the report remains ordered by total size.
-  return ranked
-    .sort((a, b) => b.info.size - a.info.size || a.path.localeCompare(b.path))
-    .map(({path, info}) => [path, info]);
+export function largestFileCandidates(
+  progress: ProgressReport,
+  count: number,
+): [string, FileInfo][] {
+  return selectLargestCandidates(progress, count, false, true).files;
+}
+
+function selectLargestCandidates(
+  progress: ProgressReport,
+  count: number,
+  includeDirectories: boolean,
+  includeFiles: boolean,
+): LargestCandidates {
+  const limit = Math.max(0, count);
+  const directories: {path: string; info: FileInfo; selectionSize: number}[] = [];
+  const files: [string, FileInfo][] = [];
+  if (limit === 0) {
+    return {directories: [], files};
+  }
+
+  progress.files.forEach((info, path) => {
+    if (path === '.') {
+      return;
+    }
+
+    if (info.isDirectory) {
+      if (!includeDirectories) {
+        return;
+      }
+      let largestChildSize = 0;
+      for (const child of info.children) {
+        if (child.isDirectory && child.size > largestChildSize) {
+          largestChildSize = child.size;
+        }
+      }
+      const selectionSize = Math.max(0, info.size - largestChildSize);
+      if (
+        selectionSize === 0 ||
+        (directories.length === limit &&
+          compareDirectoryCandidate(
+            directories[limit - 1].path,
+            directories[limit - 1].info,
+            directories[limit - 1].selectionSize,
+            path,
+            info,
+            selectionSize,
+          ) <= 0)
+      ) {
+        return;
+      }
+
+      let index = 0;
+      while (
+        index < directories.length &&
+        compareDirectoryCandidate(
+          directories[index].path,
+          directories[index].info,
+          directories[index].selectionSize,
+          path,
+          info,
+          selectionSize,
+        ) <= 0
+      ) {
+        index += 1;
+      }
+      if (index < limit) {
+        directories.splice(index, 0, {path, info, selectionSize});
+        if (directories.length > limit) {
+          directories.pop();
+        }
+      }
+    } else if (
+      includeFiles &&
+      (files.length < limit ||
+        compareFileCandidate(files[limit - 1][0], files[limit - 1][1], path, info) > 0)
+    ) {
+      let index = 0;
+      while (
+        index < files.length &&
+        compareFileCandidate(files[index][0], files[index][1], path, info) <= 0
+      ) {
+        index += 1;
+      }
+      if (index < limit) {
+        files.splice(index, 0, [path, info]);
+        if (files.length > limit) {
+          files.pop();
+        }
+      }
+    }
+  });
+
+  return {
+    // Selection uses the non-redundant size, but the report remains ordered by total size.
+    directories: directories
+      .sort((a, b) => b.info.size - a.info.size || a.path.localeCompare(b.path))
+      .map(({path, info}) => [path, info]),
+    files,
+  };
+}
+
+function compareDirectoryCandidate(
+  aPath: string,
+  aInfo: FileInfo,
+  aSelectionSize: number,
+  bPath: string,
+  bInfo: FileInfo,
+  bSelectionSize: number,
+): number {
+  return (
+    bSelectionSize - aSelectionSize ||
+    bInfo.size - aInfo.size ||
+    aPath.localeCompare(bPath)
+  );
+}
+
+function compareFileCandidate(
+  aPath: string,
+  aInfo: FileInfo,
+  bPath: string,
+  bInfo: FileInfo,
+): number {
+  return bInfo.size - aInfo.size || aPath.localeCompare(bPath);
 }
 
 function isAbortError(caught: unknown): boolean {

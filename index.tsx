@@ -8,7 +8,7 @@ import {
   createDiskUsageScanner,
   formatBytes,
   formatElapsed,
-  largestDirectoryCandidates,
+  largestCandidates,
   type DiskUsageScanner,
   type FileInfo,
   type ProgressReport,
@@ -44,8 +44,7 @@ function parseCliArgs(args: string[]): CliOptions {
 
 async function printDiskUsageSummary(scanner: DiskUsageScanner): Promise<void> {
   const progress = await scanner.wait();
-  const largestDirectories = largestDirectoryCandidates(progress, 10);
-  const largestFiles = largestEntries(progress, false, 10);
+  const {directories: largestDirectories, files: largestFiles} = largestCandidates(progress, 10);
   const status = progress.isAborted ? 'Aborted' : progress.isComplete ? 'Complete' : 'Incomplete';
   const lines = [
     `Hard disk usage report: ${progress.rootPath}`,
@@ -75,17 +74,6 @@ async function printDiskUsageSummary(scanner: DiskUsageScanner): Promise<void> {
   if (progress.errors.some(error => error.path === progress.path)) {
     process.exitCode = 1;
   }
-}
-
-function largestEntries(
-  progress: ProgressReport,
-  isDirectory: boolean,
-  count: number,
-): [string, FileInfo][] {
-  return Array.from(progress.files.entries())
-    .filter(([path, info]) => path !== '.' && info.isDirectory === isDirectory)
-    .sort(([, a], [, b]) => b.size - a.size || a.path.localeCompare(b.path))
-    .slice(0, count);
 }
 
 function formatEntrySection(
