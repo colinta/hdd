@@ -3,7 +3,7 @@ import React from 'react';
 import {type Screen, interceptConsoleLog} from '@teaui/core';
 import {run} from '@teaui/react';
 import {resolve} from 'path';
-import {App} from './App';
+import {App} from './App.js';
 import {
   createDiskUsageScanner,
   formatBytes,
@@ -12,8 +12,8 @@ import {
   type DiskUsageScanner,
   type FileInfo,
   type ProgressReport,
-} from './disk-usage';
-import {containingFolderLink, fileLink} from './terminal-link';
+} from './disk-usage.js';
+import {containingFolderLink, fileLink} from './terminal-link.js';
 
 interface CliOptions {
   printSummary: boolean;

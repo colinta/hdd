@@ -1,5 +1,6 @@
+import {existsSync} from 'node:fs';
 import React, {useEffect, useState} from 'react';
-import {Button, Scrollable, Separator, Space, Spinner, Stack, Text} from '@teaui/react';
+import {Button, Scrollable, Separator, Space, Spinner, Stack, Style, Text} from '@teaui/react';
 import {
   formatBytes,
   formatElapsed,
@@ -7,8 +8,19 @@ import {
   type DiskUsageScanner,
   type FileInfo,
   type ProgressReport,
-} from './disk-usage';
-import {containingFolderLink, fileLink} from './terminal-link';
+} from './disk-usage.js';
+import {containingFolderLink, fileLink} from './terminal-link.js';
+
+interface BuildInfo {
+  version: string;
+  commit: string;
+  isDirty: boolean;
+}
+
+const buildInfoUrl = new URL('./build-info.generated.js', import.meta.url);
+const buildInfo: BuildInfo | undefined = existsSync(buildInfoUrl)
+  ? ((await import(buildInfoUrl.href)) as {buildInfo: BuildInfo}).buildInfo
+  : undefined;
 
 export interface AppProps {
   scanner: DiskUsageScanner;
@@ -47,6 +59,20 @@ export function App({scanner, targetPath, onExit}: AppProps) {
           <Text flex={1} bold>
             Hard disk usage report: {targetPath}
           </Text>
+          {buildInfo ? (
+            <>
+              <Text dim foreground="gray">
+                {buildInfo.version} - {buildInfo.commit}
+                {buildInfo.isDirty ? (
+                  <>
+                    {' - '}
+                    <Style dim foreground="red">X</Style>
+                  </>
+                ) : null}
+              </Text>
+              <Space width={1} />
+            </>
+          ) : null}
           <Button
             title="Rescan"
             onClick={() => {

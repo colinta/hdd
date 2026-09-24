@@ -1,13 +1,14 @@
 {
   "name": "hdd-viz",
-  "version": "1.0.2",
+  "version": "1.0.3",
+  "type": "module",
   "main": ".dist/index.js",
   "license": "",
   "bin": {
     "hdd": ".dist/index.js"
   },
   "scripts": {
-    "build": "tsc",
+    "build": "node scripts/build.cjs",
     "start": "pnpm run build && node --enable-source-maps -- .dist/index.js",
     "clean": "rm -rf .dist/"
   },
