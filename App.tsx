@@ -80,6 +80,19 @@ export function App({scanner, targetPath, onExit}: AppProps) {
           />
           {!progress.isComplete && !progress.isAborted ? (
             <Button
+              title={progress.isPaused ? 'Resume' : 'Pause'}
+              onClick={() => {
+                if (progress.isPaused) {
+                  scanner.resume();
+                } else {
+                  void scanner.pause();
+                }
+                refreshReport();
+              }}
+            />
+          ) : null}
+          {!progress.isComplete && !progress.isAborted ? (
+            <Button
               title="Abort"
               onClick={() => {
                 scanner.abort();
@@ -146,6 +159,12 @@ export function StatusText({progress}: {progress: ProgressReport}) {
 
   if (progress.isComplete) {
     return <Text italic>Status: Complete</Text>;
+  }
+
+  if (progress.isPaused) {
+    return (
+      <Text italic>Status: Paused ({progress.pendingDirectories} directories remaining)</Text>
+    );
   }
 
   return (

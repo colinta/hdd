@@ -1,6 +1,6 @@
 {
   "include": ["./"],
-  "exclude": [".dist/", "scripts/"],
+  "exclude": [".dist/", "scripts/", "tests/", "vitest.config.ts"],
   "compilerOptions": {
     "target": "esnext",
     "module": "NodeNext",

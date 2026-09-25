@@ -1,5 +1,13 @@
-import {promises as fs, type Dir, type Stats} from 'fs';
 import {basename, dirname, isAbsolute, join, relative, resolve, sep} from 'path';
+import {systemClock, type Clock} from './clock.js';
+import {
+  nodeFileSystem,
+  type FileSystem,
+  type FileSystemDirectory,
+  type FileSystemStats,
+} from './filesystem.js';
+
+type Dir = FileSystemDirectory;
 
 export interface FileInfo {
   path: string;
@@ -32,6 +40,8 @@ export interface ProgressReport extends FileInfo {
   entriesScanned: number;
   pendingDirectories: number;
   isAborted: boolean;
+  /** True while the active scan is paused. Elapsed time continues to include paused time. */
+  isPaused: boolean;
   startedAt: number;
   completedAt: number | null;
   elapsedMs: number;
@@ -43,7 +53,19 @@ export interface DiskUsageScanner {
   refresh(path?: string): Promise<void>;
   ignore(path: string): void;
   abort(): void;
+  /**
+   * Stops dispatching filesystem work for the active scan, retaining queued work and open
+   * directories. Resolves once in-flight operations have finished. No-op when idle.
+   */
+  pause(): Promise<void>;
+  /** Continues a paused scan from where it stopped. */
+  resume(): void;
   wait(): Promise<ProgressReport>;
+}
+
+export interface DiskUsageScannerOptions {
+  fileSystem?: FileSystem;
+  clock?: Clock;
 }
 
 interface MutableFileInfo {
@@ -83,6 +105,11 @@ interface ScanJob {
   done: Promise<void>;
   resolveDone: () => void;
   isSettled: boolean;
+  activeTasks: number;
+  idleWaiters: (() => void)[];
+  dispatch: (() => void) | null;
+  /** Set when everything the job was scanning has been ignored; it finishes without rollback. */
+  isDiscarded: boolean;
 }
 
 type ScanTask =
@@ -107,7 +134,12 @@ const IO_CONCURRENCY = 8;
 const MAX_OPEN_DIRECTORIES = 128;
 const NOTIFICATION_INTERVAL_MS = 50;
 
-export function createDiskUsageScanner(rootPath: string): DiskUsageScanner {
+export function createDiskUsageScanner(
+  rootPath: string,
+  options: DiskUsageScannerOptions = {},
+): DiskUsageScanner {
+  const fileSystem = options.fileSystem ?? nodeFileSystem;
+  const clock = options.clock ?? systemClock;
   const rootAbsolutePath = resolve(rootPath);
   const ignoredPaths = new Set<string>();
   const listeners = new Set<() => void>();
@@ -288,9 +320,12 @@ export function createDiskUsageScanner(rootPath: string): DiskUsageScanner {
   let committedErrors: DiskUsageError[] = [];
   let lastOperationErrors: DiskUsageError[] = [];
   let isAborted = false;
-  let startedAt = Date.now();
+  // Pausing belongs to the scanner rather than a job, so a refresh requested while paused
+  // replaces the work but stays paused.
+  let isPaused = false;
+  let startedAt = clock.now();
   let completedAt: number | null = null;
-  let notificationTimer: ReturnType<typeof setTimeout> | null = null;
+  let notificationTimer: unknown = null;
 
   addSubtreeToIndex(visibleRoot);
   void startScan('.');
@@ -316,16 +351,15 @@ export function createDiskUsageScanner(rootPath: string): DiskUsageScanner {
       return;
     }
 
-    notificationTimer = setTimeout(() => {
+    notificationTimer = clock.setTimeout(() => {
       notificationTimer = null;
       emitNow();
     }, NOTIFICATION_INTERVAL_MS);
-    notificationTimer.unref?.();
   }
 
   function emitNow(): void {
     if (notificationTimer) {
-      clearTimeout(notificationTimer);
+      clock.clearTimeout(notificationTimer);
       notificationTimer = null;
     }
 
@@ -358,11 +392,15 @@ export function createDiskUsageScanner(rootPath: string): DiskUsageScanner {
       fatalError: null,
       rootWasDeleted: false,
       pendingDirectories: 0,
-      startedAt: Date.now(),
+      startedAt: clock.now(),
       completedAt: null,
       done,
       resolveDone,
       isSettled: false,
+      activeTasks: 0,
+      idleWaiters: [],
+      dispatch: null,
+      isDiscarded: false,
     };
   }
 
@@ -400,7 +438,8 @@ export function createDiskUsageScanner(rootPath: string): DiskUsageScanner {
         `Cannot refresh "${requestedPathKey}": it is not in the current scan`,
       );
       lastOperationErrors = [makeErrorReport(requestedPathKey, error)];
-      completedAt = Date.now();
+      completedAt = clock.now();
+      isPaused = false;
       emitNow();
       return;
     }
@@ -519,7 +558,6 @@ export function createDiskUsageScanner(rootPath: string): DiskUsageScanner {
     const openDirectories = new Set<Dir>();
     const deferredOpenTasks: Extract<ScanTask, {type: 'open'}>[] = [];
     let taskIndex = 0;
-    let activeTasks = 0;
 
     const enqueue = (task: ScanTask): void => {
       if (!job.controller.signal.aborted && activeJob === job) {
@@ -538,7 +576,7 @@ export function createDiskUsageScanner(rootPath: string): DiskUsageScanner {
     };
 
     const finishIfIdle = async (): Promise<void> => {
-      if (job.isSettled || activeTasks !== 0 || taskIndex < tasks.length) {
+      if (job.isSettled || job.activeTasks !== 0 || taskIndex < tasks.length) {
         return;
       }
 
@@ -561,11 +599,12 @@ export function createDiskUsageScanner(rootPath: string): DiskUsageScanner {
       while (
         !job.controller.signal.aborted &&
         activeJob === job &&
-        activeTasks < IO_CONCURRENCY &&
+        !isPaused &&
+        job.activeTasks < IO_CONCURRENCY &&
         taskIndex < tasks.length
       ) {
         const task = tasks[taskIndex++];
-        activeTasks += 1;
+        job.activeTasks += 1;
 
         executeTask(
           job,
@@ -582,7 +621,10 @@ export function createDiskUsageScanner(rootPath: string): DiskUsageScanner {
             }
           })
           .finally(() => {
-            activeTasks -= 1;
+            job.activeTasks -= 1;
+            if (job.activeTasks === 0) {
+              notifyIdleWaiters(job);
+            }
             if (taskIndex > 1024 && taskIndex * 2 > tasks.length) {
               tasks.splice(0, taskIndex);
               taskIndex = 0;
@@ -603,10 +645,12 @@ export function createDiskUsageScanner(rootPath: string): DiskUsageScanner {
       enqueue(task);
       pump();
     };
+    job.dispatch = pump;
     job.controller.signal.addEventListener('abort', onAbort, {once: true});
     pump();
     await job.done;
     job.enqueueTask = null;
+    job.dispatch = null;
     job.controller.signal.removeEventListener('abort', onAbort);
   }
 
@@ -618,6 +662,12 @@ export function createDiskUsageScanner(rootPath: string): DiskUsageScanner {
     deferredOpenTasks: Extract<ScanTask, {type: 'open'}>[],
     releaseDirectory: (directory: Dir) => void,
   ): Promise<void> {
+    if (task.type === 'read' && !isNodeActive(job, task.node)) {
+      // The directory was ignored or replaced while this read was queued; release its handle.
+      releaseDirectory(task.directory);
+      await task.directory.close().catch(() => {});
+      throw new TraversalAbortedError();
+    }
     throwIfNodeInactive(job, task.type === 'stat' ? task.node ?? task.parent : task.node);
 
     if (task.type === 'stat') {
@@ -633,7 +683,7 @@ export function createDiskUsageScanner(rootPath: string): DiskUsageScanner {
 
       let directory: Dir | null = null;
       try {
-        directory = await fs.opendir(task.node.absolutePath);
+        directory = await fileSystem.opendir(task.node.absolutePath);
         openDirectories.add(directory);
         throwIfNodeInactive(job, task.node);
         enqueue({type: 'read', node: task.node, directory});
@@ -712,13 +762,33 @@ export function createDiskUsageScanner(rootPath: string): DiskUsageScanner {
     task: Extract<ScanTask, {type: 'stat'}>,
     enqueue: (task: ScanTask) => void,
   ): Promise<void> {
-    let stats: Stats;
+    // A listed entry can be ignored before or while it is stat-ed.
+    const skipIfIgnored = (): boolean => {
+      if (task.node || !ignoredPaths.has(task.pathKey)) {
+        return false;
+      }
+      if (task.parent) {
+        childFinished(job, task.parent);
+      }
+      return true;
+    };
+    if (skipIfIgnored()) {
+      return;
+    }
+
+    let stats: FileSystemStats;
     try {
-      stats = await fs.lstat(task.absolutePath);
+      stats = await fileSystem.lstat(task.absolutePath);
       throwIfNodeInactive(job, task.node ?? task.parent);
+      if (skipIfIgnored()) {
+        return;
+      }
     } catch (caught) {
       if (isAbortError(caught)) {
         throw caught;
+      }
+      if (skipIfIgnored()) {
+        return;
       }
 
       const error = toError(caught);
@@ -830,10 +900,14 @@ export function createDiskUsageScanner(rootPath: string): DiskUsageScanner {
       return;
     }
     job.isSettled = true;
-    job.completedAt = Date.now();
+    job.completedAt = clock.now();
 
-    const wasAborted = job.controller.signal.aborted || activeJob !== job;
-    if (wasAborted || (job.fatalError && job.oldRoot)) {
+    const wasAborted =
+      !job.isDiscarded && (job.controller.signal.aborted || activeJob !== job);
+    if (job.isDiscarded) {
+      restoreJobAncestors(job);
+      lastOperationErrors = [];
+    } else if (wasAborted || (job.fatalError && job.oldRoot)) {
       rollbackJob(job);
       lastOperationErrors = job.fatalError ? [...job.errors] : [];
     } else if (job.rootWasDeleted) {
@@ -846,9 +920,52 @@ export function createDiskUsageScanner(rootPath: string): DiskUsageScanner {
       activeJob = null;
       isAborted = wasAborted;
       completedAt = job.completedAt;
+      // A superseded job keeps the pause for its replacement; abort/ignore clear it explicitly.
+      if (!wasAborted) {
+        isPaused = false;
+      }
     }
 
+    notifyIdleWaiters(job);
     job.resolveDone();
+    emitNow();
+  }
+
+  function notifyIdleWaiters(job: ScanJob): void {
+    const waiters = job.idleWaiters;
+    job.idleWaiters = [];
+    for (const waiter of waiters) {
+      waiter();
+    }
+  }
+
+  function pauseScan(): Promise<void> {
+    const job = activeJob;
+    if (!job || job.isSettled) {
+      return Promise.resolve();
+    }
+
+    if (!isPaused) {
+      isPaused = true;
+      emitNow();
+    }
+    if (job.activeTasks === 0) {
+      return Promise.resolve();
+    }
+    return new Promise(resolve => job.idleWaiters.push(resolve));
+  }
+
+  function resumeScan(): void {
+    if (!isPaused) {
+      return;
+    }
+
+    isPaused = false;
+    if (activeJob) {
+      // The pause was cancelled, so there is no checkpoint left to wait for.
+      notifyIdleWaiters(activeJob);
+      activeJob.dispatch?.();
+    }
     emitNow();
   }
 
@@ -924,7 +1041,8 @@ export function createDiskUsageScanner(rootPath: string): DiskUsageScanner {
     }
 
     isAborted = true;
-    completedAt = Date.now();
+    isPaused = false;
+    completedAt = clock.now();
     cancelJob(job, true);
     emitNow();
   }
@@ -959,28 +1077,63 @@ export function createDiskUsageScanner(rootPath: string): DiskUsageScanner {
       return;
     }
 
+    // Ignoring prunes the entry and its descendants; the rest of an active scan continues.
+    // Entries not yet listed are skipped when they are read, and queued or in-flight work
+    // under a removed node is dropped because the node is no longer indexed.
     ignoredPaths.add(pathKey);
-    refreshRequestId += 1;
-    if (activeJob) {
-      cancelJob(activeJob, true);
+    const isOutsideIgnored = (error: DiskUsageError) =>
+      !isSameOrDescendantPath(error.path, pathKey);
+    committedErrors = committedErrors.filter(isOutsideIgnored);
+    lastOperationErrors = lastOperationErrors.filter(isOutsideIgnored);
+
+    const job = activeJob;
+    if (job) {
+      job.errors = job.errors.filter(isOutsideIgnored);
+      if (!job.isSettled && isSameOrDescendantPath(pathKeyForNode(job.root), pathKey)) {
+        // Everything this job was scanning is ignored, so there is nothing to restore.
+        job.isDiscarded = true;
+        job.oldRoot = null;
+        job.controller.abort();
+      }
     }
 
     const info = files.get(pathKey);
-    if (!info) {
-      emitNow();
+    if (info) {
+      removeIgnoredNode(info, job);
+    }
+    job?.dispatch?.();
+    emitNow();
+  }
+
+  function removeIgnoredNode(info: MutableFileInfo, job: ScanJob | null): void {
+    const parent = info.parent;
+    if (job) {
+      job.pendingDirectories = Math.max(
+        0,
+        job.pendingDirectories - countPendingDirectories(info),
+      );
+      job.refreshedRoots.delete(info);
+    }
+    removeSubtreeFromIndex(info);
+    if (!parent) {
       return;
     }
 
-    removeSubtreeFromIndex(info);
-    if (info.parent) {
-      info.parent.children = info.parent.children.filter(child => child !== info);
-      addSizeToAncestors(info.parent, -info.size);
-      restoreCompleteAncestors(info.parent);
+    parent.children = parent.children.filter(child => child !== info);
+    for (let ancestor: MutableFileInfo | null = parent; ancestor; ancestor = ancestor.parent) {
+      ancestor.size -= info.size;
     }
-    committedErrors = committedErrors.filter(
-      error => !isSameOrDescendantPath(error.path, pathKey),
-    );
-    emitNow();
+
+    // An incomplete child is counted in its parent's pending children, except for a job root.
+    if (!info.isComplete && !job?.isDiscarded) {
+      const parentIsInJob =
+        job && isSameOrDescendantPath(pathKeyForNode(parent), pathKeyForNode(job.root));
+      if (parentIsInJob) {
+        childFinished(job, parent);
+      } else {
+        parent.pendingChildren = Math.max(0, parent.pendingChildren - 1);
+      }
+    }
   }
 
   function normalizePathKey(path: string): string {
@@ -1037,9 +1190,10 @@ export function createDiskUsageScanner(rootPath: string): DiskUsageScanner {
       entriesScanned: filesScanned + directoriesScanned,
       pendingDirectories: activeJob?.pendingDirectories ?? 0,
       isAborted,
+      isPaused: isPaused && activeJob !== null,
       startedAt,
       completedAt: elapsedCompletedAt,
-      elapsedMs: (elapsedCompletedAt ?? Date.now()) - startedAt,
+      elapsedMs: (elapsedCompletedAt ?? clock.now()) - startedAt,
     };
   }
 
@@ -1103,12 +1257,6 @@ export function createDiskUsageScanner(rootPath: string): DiskUsageScanner {
     return count;
   }
 
-  function restoreCompleteAncestors(node: MutableFileInfo | null): void {
-    for (let current = node; current; current = current.parent) {
-      current.isComplete = true;
-    }
-  }
-
   function restoreJobAncestors(job: ScanJob): void {
     for (const [ancestor, wasComplete] of job.ancestorCompletion) {
       ancestor.isComplete = wasComplete;
@@ -1155,6 +1303,14 @@ export function createDiskUsageScanner(rootPath: string): DiskUsageScanner {
     }
   }
 
+  function isNodeActive(job: ScanJob, node: MutableFileInfo): boolean {
+    return (
+      !job.controller.signal.aborted &&
+      activeJob === job &&
+      files.get(pathKeyForNode(node)) === node
+    );
+  }
+
   function throwIfNodeInactive(job: ScanJob, node: MutableFileInfo | null): void {
     throwIfJobInactive(job);
     if (node && files.get(pathKeyForNode(node)) !== node) {
@@ -1168,12 +1324,17 @@ export function createDiskUsageScanner(rootPath: string): DiskUsageScanner {
     refresh: refreshPath,
     ignore: ignorePath,
     abort: abortScan,
+    pause: pauseScan,
+    resume: resumeScan,
     wait: waitForCurrentRun,
   };
 }
 
-export function analyzeDiskUsage(rootPath: string): () => ProgressReport {
-  const scanner = createDiskUsageScanner(rootPath);
+export function analyzeDiskUsage(
+  rootPath: string,
+  options?: DiskUsageScannerOptions,
+): () => ProgressReport {
+  const scanner = createDiskUsageScanner(rootPath, options);
   return scanner.getReport;
 }
 
@@ -1350,8 +1511,8 @@ function getErrorCode(caught: unknown): string | undefined {
   return undefined;
 }
 
-function sizeOnDisk(stats: Stats): number {
-  const blocks = (stats as Stats & {blocks?: number}).blocks;
+function sizeOnDisk(stats: FileSystemStats): number {
+  const blocks = stats.blocks;
   if (typeof blocks === 'number' && Number.isFinite(blocks) && blocks >= 0) {
     return blocks * 512;
   }
