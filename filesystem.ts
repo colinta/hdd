@@ -9,6 +9,13 @@ export interface FileSystemStats {
   size: number;
   /** Allocated 512-byte blocks, when the platform reports them. */
   blocks?: number;
+  /**
+   * Device and inode numbers, when available. The scanner uses them to count a directory that
+   * is reachable through several paths (such as macOS firmlinks or bind mounts) only once.
+   * Values must be exact: use a bigint when a number would exceed `Number.MAX_SAFE_INTEGER`.
+   */
+  dev?: number | bigint;
+  ino?: number | bigint;
   isDirectory(): boolean;
 }
 
@@ -31,6 +38,24 @@ export interface FileSystem {
 }
 
 export const nodeFileSystem: FileSystem = {
-  lstat: path => fs.lstat(path),
+  async lstat(path) {
+    const stats = await fs.lstat(path);
+    if (
+      stats.isDirectory() &&
+      !(Number.isSafeInteger(stats.dev) && Number.isSafeInteger(stats.ino))
+    ) {
+      // Number stats round large inode numbers (APFS uses some), which could make distinct
+      // directories look identical. Re-read exact values only when they are needed.
+      const exact = await fs.lstat(path, {bigint: true});
+      return {
+        size: stats.size,
+        blocks: stats.blocks,
+        dev: exact.dev,
+        ino: exact.ino,
+        isDirectory: () => exact.isDirectory(),
+      };
+    }
+    return stats;
+  },
   opendir: path => fs.opendir(path),
 };

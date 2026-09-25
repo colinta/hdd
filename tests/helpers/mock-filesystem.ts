@@ -33,6 +33,9 @@ import {ManualClock} from './manual-clock.js';
  * - `readMs` (default 0): each directory handle `read()`.
  * Operations complete at the end of their delay: results reflect the filesystem at that moment.
  * `opendir` snapshots the entry names when it completes, like a real directory stream would.
+ *
+ * Every entry has a stable inode number (on device 1). `linkDirectory` makes one directory
+ * reachable through a second path, like a macOS firmlink or a bind mount.
  */
 
 export type MockOperation = 'lstat' | 'opendir' | 'read' | 'close';
@@ -80,6 +83,19 @@ interface MockSymlink {
 }
 
 type MockNode = MockFile | MockDirectory | MockSymlink;
+
+const MOCK_DEVICE = 1;
+const inodes = new WeakMap<MockNode, number>();
+let nextInode = 1;
+
+function inodeOf(node: MockNode): number {
+  let inode = inodes.get(node);
+  if (inode === undefined) {
+    inode = nextInode++;
+    inodes.set(node, inode);
+  }
+  return inode;
+}
 
 const UNIT_POWERS: Record<string, number> = {
   b: 0,
@@ -378,6 +394,8 @@ export class MockFileSystem implements FileSystem {
       return {
         size: node.size,
         ...(node.blocks === undefined ? {} : {blocks: node.blocks}),
+        dev: MOCK_DEVICE,
+        ino: inodeOf(node),
         isDirectory: () => node.type === 'directory',
         isFile: () => node.type === 'file',
         isSymbolicLink: () => node.type === 'symlink',
@@ -430,14 +448,24 @@ export class MockFileSystem implements FileSystem {
 
   /**
    * The size the scanner should report for a path: allocated blocks (× 512) when set, otherwise
-   * the apparent size, summed over the subtree. Symbolic links are not followed.
+   * the apparent size, summed over the subtree. Symbolic links are not followed, and a directory
+   * reachable through several paths (see `linkDirectory`) is counted once.
    */
   diskUsage(path = '/'): number {
     const {node} = this.lookup(normalize(path), false);
     if (!node) {
       throw createFileSystemError('ENOENT', 'diskUsage', path);
     }
-    return usage(node);
+    return usage(node, new Set());
+  }
+
+  /** The inode number `lstat` reports for a path. */
+  inode(path: string): number {
+    const {node} = this.lookup(normalize(path), false);
+    if (!node) {
+      throw createFileSystemError('ENOENT', 'inode', path);
+    }
+    return inodeOf(node);
   }
 
   // Mutation. These are setup helpers: they create missing parents and replace existing entries.
@@ -480,6 +508,18 @@ export class MockFileSystem implements FileSystem {
       size: options.size === undefined ? Buffer.byteLength(target) : parseSize(options.size),
       ...(options.blocks === undefined ? {} : {blocks: options.blocks}),
     });
+  }
+
+  /**
+   * Makes an existing directory reachable at a second path. Both paths report the same inode
+   * and share contents, like a macOS firmlink or a bind mount.
+   */
+  linkDirectory(path: string, targetPath: string): void {
+    const {node} = this.lookup(normalize(targetPath), true);
+    if (node?.type !== 'directory') {
+      throw new Error(`Cannot link to "${targetPath}": it is not a directory`);
+    }
+    this.setNode(path, node);
   }
 
   /** Removes an entry and everything beneath it. */
@@ -653,11 +693,17 @@ export function createMockFileSystem(
   return new MockFileSystem(description, options);
 }
 
-function usage(node: MockNode): number {
+function usage(node: MockNode, seenDirectories: Set<MockDirectory>): number {
+  if (node.type === 'directory') {
+    if (seenDirectories.has(node)) {
+      return 0;
+    }
+    seenDirectories.add(node);
+  }
   let total = node.blocks === undefined ? node.size : node.blocks * 512;
   if (node.type === 'directory') {
     for (const child of node.children.values()) {
-      total += usage(child);
+      total += usage(child, seenDirectories);
     }
   }
   return total;

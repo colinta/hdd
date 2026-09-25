@@ -35,6 +35,14 @@ describe('nodeFileSystem', () => {
     expect((await nodeFileSystem.lstat(join(root, 'top.txt'))).size).toBe(10_000);
   });
 
+  it('reports directory identities', async () => {
+    const stats = await nodeFileSystem.lstat(join(root, 'nested'));
+    expect(stats.dev).toBeDefined();
+    expect(stats.ino).toBeDefined();
+    const ino = stats.ino!;
+    expect(typeof ino === 'bigint' || Number.isSafeInteger(ino)).toBe(true);
+  });
+
   it('scans a real directory by default', async () => {
     const report = await createDiskUsageScanner(root).wait();
 

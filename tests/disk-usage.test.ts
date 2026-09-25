@@ -1,4 +1,5 @@
 import {describe, expect, it} from 'vitest';
+import {largestCandidates} from '../disk-usage.js';
 import {parseSize} from './helpers/mock-filesystem.js';
 import {
   createTestScanner,
@@ -44,6 +45,8 @@ describe('scanning', () => {
     );
     expect(report.size).toBe(fs.diskUsage());
     expect(report.files.get('folder')?.size).toBe(parseSize('1.2mb') + parseSize('2.4gb'));
+    expect(report.files.get('folder')?.childCount).toBe(2);
+    expect(report.childCount).toBe(2);
     expect(report.isComplete).toBe(true);
     expect(report.isAborted).toBe(false);
     expect(report.errors).toEqual([]);
@@ -696,5 +699,186 @@ describe('ignore', () => {
     expect(fs.operationsFor({within: '/folder2/folder3'})).toEqual([]);
     expect(report.size).toBe(parseSize('1.2mb') + parseSize('2.4gb'));
     expectConsistentReport(report);
+  });
+});
+
+describe('directory aliases', () => {
+  // Like macOS, where /System/Volumes/Data/Users is a firmlink to /Users.
+  const FIRMLINKED = `
+    /Users
+      /colin
+        big 1gb
+    /System
+      /Volumes
+        /Data
+          other 1kb
+  `;
+
+  function createFirmlinkedScanner() {
+    const scanner = createTestScanner(FIRMLINKED, TIMED);
+    scanner.fs.linkDirectory('/System/Volumes/Data/Users', '/Users');
+    return scanner;
+  }
+
+  it('counts a directory reachable through several paths once', async () => {
+    const {fs, finish} = createFirmlinkedScanner();
+    const report = await finish();
+
+    expect(report.size).toBe(fs.diskUsage());
+    expect(report.size).toBe(parseSize('1gb') + parseSize('1kb'));
+    const alias = report.files.get('System/Volumes/Data/Users')!;
+    expect(alias).toMatchObject({isDirectory: true, isComplete: true, size: 0, aliasOf: 'Users'});
+    expect(alias.children).toEqual([]);
+    expect(report.files.get('Users')?.aliasOf).toBeNull();
+    expect(fs.operationsFor({within: '/System/Volumes/Data/Users'})).toEqual([
+      expect.objectContaining({operation: 'lstat', path: '/System/Volumes/Data/Users'}),
+    ]);
+    expectConsistentReport(report);
+  });
+
+  it('keeps aliases through rescans of either path', async () => {
+    const {fs, scanner, clock, finish} = createFirmlinkedScanner();
+    await finish();
+
+    void scanner.refresh('Users');
+    let report = await finishScan(scanner, clock);
+    expect(report.files.get('System/Volumes/Data/Users')?.aliasOf).toBe('Users');
+
+    void scanner.refresh('System/Volumes/Data/Users');
+    report = await finishScan(scanner, clock);
+    expect(report.files.get('System/Volumes/Data/Users')?.aliasOf).toBe('Users');
+
+    void scanner.refresh();
+    report = await finishScan(scanner, clock);
+    expect(report.files.get('System/Volumes/Data/Users')?.aliasOf).toBe('Users');
+    expect(report.size).toBe(fs.diskUsage());
+    expectConsistentReport(report);
+  });
+
+  it('still detects aliases after an aborted rescan restores the previous tree', async () => {
+    const {fs, scanner, clock, finish} = createFirmlinkedScanner();
+    await finish();
+
+    void scanner.refresh();
+    await clock.advance(150);
+    scanner.abort();
+    await finishScan(scanner, clock);
+
+    void scanner.refresh('System');
+    const report = await finishScan(scanner, clock);
+    expect(report.files.get('System/Volumes/Data/Users')?.aliasOf).toBe('Users');
+    expect(report.size).toBe(fs.diskUsage());
+    expectConsistentReport(report);
+  });
+});
+
+describe('memory', () => {
+  const MANY = Array.from(
+    {length: 40},
+    (_, directory) =>
+      `/directory-${directory}\n` +
+      Array.from({length: 25}, (_, file) => `  file-${file} 1kb`).join('\n'),
+  ).join('\n');
+
+  it('reuses storage across repeated rescans', async () => {
+    const {scanner, clock, finish} = createTestScanner(MANY);
+    await finish();
+    const first = scanner.getMemoryUsage();
+    expect(first.entries).toBe(1 + 40 + 40 * 25);
+
+    for (let round = 0; round < 5; round++) {
+      void scanner.refresh();
+      await finishScan(scanner, clock);
+      void scanner.refresh('directory-7');
+      await finishScan(scanner, clock);
+    }
+
+    const after = scanner.getMemoryUsage();
+    expect(after.entries).toBe(first.entries);
+    expect(after.entryCapacity).toBe(first.entryCapacity);
+    expect(after.nameBytes).toBe(first.nameBytes);
+    expectConsistentReport(scanner.getReport());
+  });
+
+  it('keeps the previous subtree only until a refresh settles', async () => {
+    const {scanner, clock, finish} = createTestScanner(MANY, {fileMs: 10, directoryMs: 100});
+    await finish();
+    const before = scanner.getMemoryUsage().entries;
+
+    void scanner.refresh();
+    await clock.advance(250);
+    expect(scanner.getMemoryUsage().entries).toBeGreaterThan(before);
+
+    scanner.abort();
+    await finishScan(scanner, clock);
+    expect(scanner.getMemoryUsage().entries).toBe(before);
+  });
+
+  it('releases ignored entries', async () => {
+    const {scanner, finish} = createTestScanner(MANY);
+    await finish();
+    const before = scanner.getMemoryUsage().entries;
+
+    scanner.ignore('directory-3');
+    expect(scanner.getMemoryUsage().entries).toBe(before - 26);
+  });
+
+  it('turns views of removed entries into empty placeholders', async () => {
+    const {scanner, finish} = createTestScanner(EXAMPLE);
+    const report = await finish();
+    const folder = report.files.get('folder')!;
+
+    scanner.ignore('folder');
+    expect(folder.size).toBe(0);
+    expect(folder.children).toEqual([]);
+    expect(folder.path).toBe('folder');
+  });
+});
+
+describe('largest candidates', () => {
+  const RANKED = `
+    /a
+      /b
+        big 10mb
+      small 1mb
+    /c
+      medium 5mb
+    top 2mb
+  `;
+
+  it('ranks files by size and directories by space beyond their largest child', async () => {
+    const {finish} = createTestScanner(RANKED);
+    const report = await finish();
+
+    const three = largestCandidates(report, 3);
+    expect(three.files.map(([path]) => path)).toEqual(['a/b/big', 'c/medium', 'top']);
+    // a accounts for only 1mb beyond a/b, but all three fit; they are ordered by total size.
+    expect(three.directories.map(([path]) => path)).toEqual(['a', 'a/b', 'c']);
+    expect(three.directories[0][1]).toBe(report.files.get('a'));
+
+    const two = largestCandidates(report, 2);
+    expect(two.directories.map(([path]) => path)).toEqual(['a/b', 'c']);
+  });
+
+  it('recomputes rankings at most once per second while scanning', async () => {
+    const {fs, clock, scanner, finish} = createTestScanner(EXAMPLE, TIMED);
+    fs.setDelay('/folder2/folder3', 'opendir', 5_000);
+
+    await clock.advanceTo(205);
+    expect(largestCandidates(scanner.getReport(), 5).files).toEqual([]);
+    await clock.advanceTo(250); // folder's files are scanned, but the ranking is cached
+    expect(largestCandidates(scanner.getReport(), 5).files).toEqual([]);
+    await clock.advanceTo(1_300);
+    expect(largestCandidates(scanner.getReport(), 5).files.map(([path]) => path)).toEqual([
+      'folder/filename-2',
+      'folder/filename-1',
+    ]);
+
+    const report = await finish();
+    expect(largestCandidates(report, 5).files.map(([path]) => path)).toEqual([
+      'folder/filename-2',
+      'folder2/folder3/file-1',
+      'folder/filename-1',
+    ]);
   });
 });

@@ -247,6 +247,10 @@ function Files({files, onRefresh}: {files: FileInfo[]; onRefresh(): void}) {
   );
 }
 
+// Entry views are created lazily, but rendering a directory with (say) 100k children would still
+// build a TeaUI row for each one. Show the largest entries and summarize the rest.
+const MAX_ROWS_PER_DIRECTORY = 500;
+
 function FileRows({
   files,
   expandedPaths,
@@ -258,17 +262,24 @@ function FileRows({
   onToggle(path: string): void;
   onRefresh(): void;
 }) {
+  // Siblings share a parent path, so comparing names orders them like comparing paths.
   const sorted: FileInfo[] = [...files].sort(
-    (a, b) => b.size - a.size || a.path.localeCompare(b.path),
+    (a, b) => b.size - a.size || a.name.localeCompare(b.name),
   );
 
   if (!sorted.length) {
     return null;
   }
 
+  const visible = sorted.slice(0, MAX_ROWS_PER_DIRECTORY);
+  const hiddenCount = sorted.length - visible.length;
+  const hiddenSize = sorted
+    .slice(MAX_ROWS_PER_DIRECTORY)
+    .reduce((total, fileInfo) => total + fileInfo.size, 0);
+
   return (
     <Stack.down>
-      {sorted.map((fileInfo, index) => {
+      {visible.map((fileInfo, index) => {
         const summary = fileInfo.name + (fileInfo.isDirectory ? '/' : '');
         const isDirExpanded = fileInfo.isDirectory && expandedPaths.has(fileInfo.path);
 
@@ -311,7 +322,12 @@ function FileRows({
                 />
               ) : null}
               <Text italic> {formatBytes(fileInfo.size)}</Text>
-              {fileInfo.isDirectory ? <Text> ({fileInfo.children.length})</Text> : null}
+              {fileInfo.isDirectory && !fileInfo.aliasOf ? (
+                <Text> ({fileInfo.childCount})</Text>
+              ) : null}
+              {fileInfo.aliasOf ? (
+                <Text dim> (already counted at {fileInfo.aliasOf})</Text>
+              ) : null}
               {!fileInfo.isComplete ? <Text> scanning…</Text> : null}
               {fileInfo.error ? <Text> ⚠ {fileInfo.error.message}</Text> : null}
             </Stack.right>
@@ -329,6 +345,12 @@ function FileRows({
           </Stack.down>
         );
       })}
+      {hiddenCount ? (
+        <Text italic>
+          {'   '}
+          …and {hiddenCount} more ({formatBytes(hiddenSize)})
+        </Text>
+      ) : null}
     </Stack.down>
   );
 }

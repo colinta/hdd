@@ -1,5 +1,22 @@
-import {basename, dirname, isAbsolute, join, relative, resolve, sep} from 'path';
+import {Buffer} from 'node:buffer';
+import {basename, dirname, isAbsolute, relative, resolve, sep} from 'node:path';
 import {systemClock, type Clock} from './clock.js';
+import {
+  ALIAS,
+  COMPLETE,
+  DETACHED,
+  DIRECTORY,
+  DirectoryIdentityTable,
+  ENTRIES_READ,
+  EntryStore,
+  HAS_ERROR,
+  IDENTITY_KEEP,
+  IDENTITY_MATCH,
+  IDENTITY_STALE,
+  NONE,
+  readDirectoryIdentity,
+  type IdentityClassification,
+} from './entry-store.js';
 import {
   nodeFileSystem,
   type FileSystem,
@@ -9,6 +26,11 @@ import {
 
 type Dir = FileSystemDirectory;
 
+/**
+ * A view of one scanned entry. Views are created on demand and read the scanner's compact
+ * storage, so sizes and completion reflect the latest scan state. A view of an entry that has
+ * since been removed reports no size and no children.
+ */
 export interface FileInfo {
   path: string;
   absolutePath: string;
@@ -17,11 +39,30 @@ export interface FileInfo {
   isDirectory: boolean;
   isComplete: boolean;
   error: Error | null;
+  /**
+   * For a directory reachable through another path that was already counted (the same device
+   * and inode, e.g. a macOS firmlink), that path relative to the scan root. Its contents are
+   * not scanned or counted again. `null` for every other entry.
+   */
+  aliasOf: string | null;
+  /** Number of direct children, without creating a view for each. */
+  childCount: number;
   children: FileInfo[];
   refresh(): Promise<void>;
   recalculate(): void;
   abort(): void;
   ignore(): void;
+}
+
+/** Looks up scanned entries by path relative to the scan root (`.` is the root). */
+export interface FileIndex extends Iterable<[string, FileInfo]> {
+  readonly size: number;
+  get(path: string): FileInfo | undefined;
+  has(path: string): boolean;
+  keys(): IterableIterator<string>;
+  values(): IterableIterator<FileInfo>;
+  entries(): IterableIterator<[string, FileInfo]>;
+  forEach(callback: (info: FileInfo, path: string) => void): void;
 }
 
 export interface DiskUsageError {
@@ -30,9 +71,14 @@ export interface DiskUsageError {
   code?: string;
 }
 
+export interface LargestCandidates {
+  directories: [string, FileInfo][];
+  files: [string, FileInfo][];
+}
+
 export interface ProgressReport extends FileInfo {
   rootPath: string;
-  files: Map<string, FileInfo>;
+  files: FileIndex;
   errors: DiskUsageError[];
   error: Error | null;
   filesScanned: number;
@@ -45,6 +91,18 @@ export interface ProgressReport extends FileInfo {
   startedAt: number;
   completedAt: number | null;
   elapsedMs: number;
+  /** See `largestCandidates`. */
+  largest(count: number): LargestCandidates;
+}
+
+export interface DiskUsageMemoryUsage {
+  /** Entries currently stored, including a previous subtree kept while it is refreshed. */
+  entries: number;
+  entryCapacity: number;
+  entryBytes: number;
+  nameBytes: number;
+  nameCapacityBytes: number;
+  identityBytes: number;
 }
 
 export interface DiskUsageScanner {
@@ -61,6 +119,7 @@ export interface DiskUsageScanner {
   /** Continues a paused scan from where it stopped. */
   resume(): void;
   wait(): Promise<ProgressReport>;
+  getMemoryUsage(): DiskUsageMemoryUsage;
 }
 
 export interface DiskUsageScannerOptions {
@@ -68,33 +127,19 @@ export interface DiskUsageScannerOptions {
   clock?: Clock;
 }
 
-interface MutableFileInfo {
-  path: string;
-  absolutePath: string;
-  name: string;
-  size: number;
-  isDirectory: boolean;
-  isComplete: boolean;
-  entriesRead: boolean;
-  pendingChildren: number;
-  error: Error | null;
-  children: MutableFileInfo[];
-  parent: MutableFileInfo | null;
-  refresh(): Promise<void>;
-  recalculate(): void;
-  abort(): void;
-  ignore(): void;
-}
-
 interface ScanJob {
   id: number;
+  /** The path this job scans, relative to the scanner root. */
+  pathKey: string;
   controller: AbortController;
-  root: MutableFileInfo;
-  oldRoot: MutableFileInfo | null;
-  oldParent: MutableFileInfo | null;
-  oldIndex: number;
-  ancestorCompletion: Map<MutableFileInfo, boolean>;
-  refreshedRoots: Set<MutableFileInfo>;
+  root: number;
+  rootGeneration: number;
+  /** The previous subtree, kept aside so an aborted or failed refresh can restore it. */
+  oldRoot: number;
+  oldParent: number;
+  /** Completion of the job root's ancestors when it started: id → generation * 2 + complete. */
+  ancestorCompletion: Map<number, number>;
+  refreshedRoots: Set<number>;
   enqueueTask: ((task: ScanTask) => void) | null;
   errors: DiskUsageError[];
   fatalError: Error | null;
@@ -112,16 +157,30 @@ interface ScanJob {
   isDiscarded: boolean;
 }
 
+// Tasks refer to entries by `(id, generation)`, so work for a removed entry is detected even
+// after its slot is reused. Only the bounded set of queued tasks carries path strings.
 type ScanTask =
   | {
       type: 'stat';
       absolutePath: string;
-      pathKey: string;
-      parent: MutableFileInfo | null;
-      node?: MutableFileInfo;
+      /** Basename of a newly listed entry. */
+      name: string;
+      parent: number;
+      parentGeneration: number;
+      /** An existing entry being re-stat-ed (a refresh root), or NONE for a new entry. */
+      node: number;
+      nodeGeneration: number;
     }
-  | {type: 'open'; node: MutableFileInfo}
-  | {type: 'read'; node: MutableFileInfo; directory: Dir};
+  | {type: 'open'; node: number; generation: number}
+  | {type: 'read'; node: number; generation: number; directory: Dir};
+
+interface Candidate {
+  id: number;
+  generation: number;
+  size: number;
+  selectionSize: number;
+  path: string | null;
+}
 
 class TraversalAbortedError extends Error {
   constructor() {
@@ -133,6 +192,8 @@ class TraversalAbortedError extends Error {
 const IO_CONCURRENCY = 8;
 const MAX_OPEN_DIRECTORIES = 128;
 const NOTIFICATION_INTERVAL_MS = 50;
+/** While scanning, largest-entry rankings are recomputed at most this often. */
+const LARGEST_REFRESH_MS = 1000;
 
 export function createDiskUsageScanner(
   rootPath: string,
@@ -141,182 +202,25 @@ export function createDiskUsageScanner(
   const fileSystem = options.fileSystem ?? nodeFileSystem;
   const clock = options.clock ?? systemClock;
   const rootAbsolutePath = resolve(rootPath);
+  const rootName = basename(rootAbsolutePath);
   const ignoredPaths = new Set<string>();
   const listeners = new Set<() => void>();
-  const files = new Map<string, MutableFileInfo>();
 
-  const emptyChildren: MutableFileInfo[] = [];
+  const store = new EntryStore();
+  const identities = new DirectoryIdentityTable(classifyIdentityOwner);
+  const identityScratch = new Uint32Array(4);
+  // Sparse state: only directories still being scanned, failed entries, and aliases.
+  const pendingChildren = new Map<number, number>();
+  const nodeErrors = new Map<number, DiskUsageError>();
+  // Alias entry → the directory identity it shares, resolved to the current owner on demand.
+  const aliasIdentities = new Map<number, Uint32Array>();
 
-  class MutableFileInfoNode implements MutableFileInfo {
-    size = 0;
-    isComplete = false;
-    entriesRead = false;
-    pendingChildren = 0;
-    error: Error | null = null;
-    children: MutableFileInfo[] = [];
-
-    constructor(
-      public path: string,
-      public isDirectory: boolean,
-      public parent: MutableFileInfo | null,
-    ) {}
-
-    get absolutePath(): string {
-      return this.parent ? join(rootAbsolutePath, this.path) : rootAbsolutePath;
-    }
-
-    get name(): string {
-      return basename(this.path);
-    }
-
-    refresh(): Promise<void> {
-      return refreshPath(this.absolutePath);
-    }
-
-    recalculate(): void {
-      // Sizes are updated incrementally by the active subtree scan.
-    }
-
-    abort(): void {
-      abortScan();
-    }
-
-    ignore(): void {
-      ignorePath(this.absolutePath);
-    }
-  }
-
-  class DirectoryInfoNode implements MutableFileInfo {
-    size = 0;
-    isComplete = false;
-    entriesRead = false;
-    pendingChildren = 0;
-
-    constructor(
-      public path: string,
-      public parent: MutableFileInfo,
-    ) {}
-
-    get absolutePath(): string {
-      return join(rootAbsolutePath, this.path);
-    }
-
-    get name(): string {
-      return basename(this.path);
-    }
-
-    get isDirectory(): boolean {
-      return true;
-    }
-
-    get children(): MutableFileInfo[] {
-      return emptyChildren;
-    }
-
-    set children(children: MutableFileInfo[]) {
-      if (children !== emptyChildren) {
-        Object.defineProperty(this, 'children', {
-          value: children,
-          writable: true,
-          configurable: true,
-        });
-      }
-    }
-
-    get error(): Error | null {
-      return null;
-    }
-
-    set error(error: Error | null) {
-      if (error) {
-        Object.defineProperty(this, 'error', {
-          value: error,
-          writable: true,
-          configurable: true,
-        });
-      }
-    }
-
-    refresh(): Promise<void> {
-      return refreshPath(this.absolutePath);
-    }
-
-    recalculate(): void {
-      // Sizes are updated incrementally by the active subtree scan.
-    }
-
-    abort(): void {
-      abortScan();
-    }
-
-    ignore(): void {
-      ignorePath(this.absolutePath);
-    }
-  }
-
-  class CompletedFileInfoNode implements MutableFileInfo {
-    constructor(
-      public path: string,
-      public size: number,
-    ) {}
-
-    get parent(): MutableFileInfo | null {
-      return files.get(dirname(this.path)) ?? null;
-    }
-
-    get absolutePath(): string {
-      return join(rootAbsolutePath, this.path);
-    }
-
-    get name(): string {
-      return basename(this.path);
-    }
-
-    get isDirectory(): boolean {
-      return false;
-    }
-
-    get isComplete(): boolean {
-      return true;
-    }
-
-    get entriesRead(): boolean {
-      return true;
-    }
-
-    get pendingChildren(): number {
-      return 0;
-    }
-
-    get error(): Error | null {
-      return null;
-    }
-
-    get children(): MutableFileInfo[] {
-      return emptyChildren;
-    }
-
-    refresh(): Promise<void> {
-      return refreshPath(this.absolutePath);
-    }
-
-    recalculate(): void {}
-
-    abort(): void {
-      abortScan();
-    }
-
-    ignore(): void {
-      ignorePath(this.absolutePath);
-    }
-  }
-
-  let visibleRoot = createMutableFileInfo(rootAbsolutePath, null, true);
+  let visibleRoot = store.allocate('', NONE, DIRECTORY, 0);
   let activeJob: ScanJob | null = null;
   let operationId = 0;
   let refreshRequestId = 0;
   let filesScanned = 0;
-  let directoriesScanned = 0;
+  let directoriesScanned = 1;
   let committedErrors: DiskUsageError[] = [];
   let lastOperationErrors: DiskUsageError[] = [];
   let isAborted = false;
@@ -326,20 +230,179 @@ export function createDiskUsageScanner(
   let startedAt = clock.now();
   let completedAt: number | null = null;
   let notificationTimer: unknown = null;
+  // Incremented whenever entries are added to or removed from the tree by something other
+  // than the steady progress of a scan; invalidates cached rankings.
+  let structureVersion = 0;
+  let largestCache: {
+    limit: number;
+    version: number;
+    computedAt: number;
+    wasScanning: boolean;
+    directories: Candidate[];
+    files: Candidate[];
+  } | null = null;
 
-  addSubtreeToIndex(visibleRoot);
   void startScan('.');
 
-  function createMutableFileInfo(
-    absolutePath: string,
-    parent: MutableFileInfo | null,
-    isDirectory: boolean,
-  ): MutableFileInfo {
-    const relativePath = relative(rootAbsolutePath, absolutePath);
-    const path = parent ? relativePath || basename(absolutePath) : rootAbsolutePath;
+  // Entry helpers
 
-    return new MutableFileInfoNode(path, isDirectory, parent);
+  function hasFlags(id: number, mask: number): boolean {
+    return (store.flags(id) & mask) !== 0;
   }
+
+  function isDirectoryEntry(id: number): boolean {
+    return hasFlags(id, DIRECTORY);
+  }
+
+  function isLiveRef(id: number, generation: number): boolean {
+    return id === NONE || store.isLive(id, generation);
+  }
+
+  function pathKeyFor(id: number): string {
+    if (store.parent(id) === NONE) {
+      return '.';
+    }
+    const names: string[] = [];
+    for (let current = id; store.parent(current) !== NONE; current = store.parent(current)) {
+      names.push(store.name(current));
+    }
+    names.reverse();
+    return names.join(sep);
+  }
+
+  function absolutePathForKey(pathKey: string): string {
+    if (pathKey === '.') {
+      return rootAbsolutePath;
+    }
+    return rootAbsolutePath.endsWith(sep)
+      ? rootAbsolutePath + pathKey
+      : rootAbsolutePath + sep + pathKey;
+  }
+
+  function absolutePathFor(id: number): string {
+    return absolutePathForKey(pathKeyFor(id));
+  }
+
+  /** Finds the entry linked into the visible tree at a path key, or NONE. */
+  function resolvePathKey(pathKey: string): number {
+    if (pathKey === '.') {
+      return visibleRoot;
+    }
+    let id = visibleRoot;
+    for (const segment of pathKey.split(sep)) {
+      if (!segment || segment === '.' || segment === '..') {
+        return NONE;
+      }
+      id = store.findChild(id, Buffer.from(segment, 'utf8'));
+      if (id === NONE) {
+        return NONE;
+      }
+    }
+    return id;
+  }
+
+  function isAttached(id: number): boolean {
+    for (let current = id; ; current = store.parent(current)) {
+      if (hasFlags(current, DETACHED)) {
+        return false;
+      }
+      if (store.parent(current) === NONE) {
+        return current === visibleRoot;
+      }
+    }
+  }
+
+  function classifyIdentityOwner(id: number, generation: number): IdentityClassification {
+    if (
+      !store.isLive(id, generation) ||
+      (store.flags(id) & (DIRECTORY | ALIAS)) !== DIRECTORY
+    ) {
+      return IDENTITY_STALE;
+    }
+    return isAttached(id) ? IDENTITY_MATCH : IDENTITY_KEEP;
+  }
+
+  /**
+   * Registers a directory's identity. Returns the entry that already owns it, in which case
+   * this directory is an alias of that entry and must not be scanned again.
+   */
+  function claimDirectoryIdentity(stats: FileSystemStats, id: number): number {
+    if (!readDirectoryIdentity(stats, identityScratch)) {
+      return NONE;
+    }
+    const owner = identities.find(identityScratch);
+    if (owner !== NONE && owner !== id) {
+      return owner;
+    }
+    if (owner === NONE) {
+      identities.insert(identityScratch, id, store.generation(id));
+    }
+    return NONE;
+  }
+
+  function countEntries(root: number, sign: 1 | -1): void {
+    store.forEachInSubtree(root, id => {
+      if (isDirectoryEntry(id)) {
+        directoriesScanned += sign;
+      } else {
+        filesScanned += sign;
+      }
+    });
+  }
+
+  /** Recycles an unlinked subtree and its sparse state. */
+  function releaseTree(root: number, wasAttached: boolean): void {
+    const job = activeJob;
+    store.releaseSubtree(root, id => {
+      const flags = store.flags(id);
+      if (wasAttached) {
+        if (flags & DIRECTORY) {
+          directoriesScanned -= 1;
+        } else {
+          filesScanned -= 1;
+        }
+      }
+      if (flags & HAS_ERROR) {
+        nodeErrors.delete(id);
+      }
+      if (flags & ALIAS) {
+        aliasIdentities.delete(id);
+      }
+      pendingChildren.delete(id);
+      job?.refreshedRoots.delete(id);
+    });
+    structureVersion += 1;
+  }
+
+  function pendingChildrenOf(id: number): number {
+    return pendingChildren.get(id) ?? 0;
+  }
+
+  function addPendingChildren(id: number, delta: number): void {
+    const next = Math.max(0, pendingChildrenOf(id) + delta);
+    if (next) {
+      pendingChildren.set(id, next);
+    } else {
+      pendingChildren.delete(id);
+    }
+  }
+
+  function setNodeError(id: number, report: DiskUsageError): void {
+    nodeErrors.set(id, report);
+    store.addFlags(id, HAS_ERROR);
+  }
+
+  function clearNodeState(id: number): void {
+    if (hasFlags(id, HAS_ERROR)) {
+      nodeErrors.delete(id);
+    }
+    if (hasFlags(id, ALIAS)) {
+      aliasIdentities.delete(id);
+    }
+    store.clearFlags(id, COMPLETE | ENTRIES_READ | HAS_ERROR | ALIAS);
+  }
+
+  // Notifications
 
   function subscribe(listener: () => void): () => void {
     listeners.add(listener);
@@ -368,23 +431,29 @@ export function createDiskUsageScanner(
     }
   }
 
-  function createJob(root: MutableFileInfo, oldRoot: MutableFileInfo | null): ScanJob {
+  // Jobs
+
+  function createJob(root: number, oldRoot: number, pathKey: string): ScanJob {
     let resolveDone = () => {};
     const done = new Promise<void>(resolve => {
       resolveDone = resolve;
     });
-    const ancestorCompletion = new Map<MutableFileInfo, boolean>();
-    for (let ancestor = root.parent; ancestor; ancestor = ancestor.parent) {
-      ancestorCompletion.set(ancestor, ancestor.isComplete);
+    const ancestorCompletion = new Map<number, number>();
+    for (let ancestor = store.parent(root); ancestor !== NONE; ancestor = store.parent(ancestor)) {
+      ancestorCompletion.set(
+        ancestor,
+        store.generation(ancestor) * 2 + (hasFlags(ancestor, COMPLETE) ? 1 : 0),
+      );
     }
 
     return {
       id: ++operationId,
+      pathKey,
       controller: new AbortController(),
       root,
+      rootGeneration: store.generation(root),
       oldRoot,
-      oldParent: oldRoot?.parent ?? null,
-      oldIndex: oldRoot?.parent ? oldRoot.parent.children.indexOf(oldRoot) : -1,
+      oldParent: oldRoot !== NONE ? store.parent(oldRoot) : NONE,
       ancestorCompletion,
       refreshedRoots: new Set(),
       enqueueTask: null,
@@ -404,13 +473,17 @@ export function createDiskUsageScanner(
     };
   }
 
+  function isJobRunning(job: ScanJob): boolean {
+    return !job.isSettled && !job.controller.signal.aborted && activeJob === job;
+  }
+
   async function startScan(requestedPathKey: string): Promise<void> {
     const requestId = ++refreshRequestId;
     const previousJob = activeJob;
     let pathKey = existingPathOrParent(requestedPathKey);
 
-    if (previousJob && pathKey) {
-      const jobPath = pathKeyForNode(previousJob.root);
+    if (previousJob && pathKey && isJobRunning(previousJob)) {
+      const jobPath = previousJob.pathKey;
       if (
         pathKey !== jobPath &&
         isSameOrDescendantPath(pathKey, jobPath) &&
@@ -444,15 +517,21 @@ export function createDiskUsageScanner(
       return;
     }
 
-    const requested = files.get(pathKey) ?? visibleRoot;
+    const requested = resolvePathKey(pathKey) || visibleRoot;
     // Keep a partial subtree as the rollback point for a targeted refresh. Falling back to the
     // scanner root here makes a refresh button unexpectedly restart the entire tree.
-    const canReplaceRequested = pathKey !== '.' || requested.isComplete;
-    const oldRoot = canReplaceRequested ? requested : null;
-    const scanPath = oldRoot ? pathKey : '.';
-    const replaced = oldRoot ?? visibleRoot;
-    const staging = createMutableFileInfo(replaced.absolutePath, replaced.parent, replaced.isDirectory);
-    const job = createJob(staging, oldRoot);
+    const canReplaceRequested = pathKey !== '.' || hasFlags(requested, COMPLETE);
+    const oldRoot = canReplaceRequested ? requested : NONE;
+    const scanPath = oldRoot !== NONE ? pathKey : '.';
+    const replaced = oldRoot !== NONE ? oldRoot : visibleRoot;
+    const replacedParent = store.parent(replaced);
+    const staging = store.allocate(
+      replacedParent === NONE ? '' : store.name(replaced),
+      replacedParent,
+      store.flags(replaced) & DIRECTORY,
+      0,
+    );
+    const job = createJob(staging, oldRoot, scanPath);
 
     activeJob = job;
     isAborted = false;
@@ -461,10 +540,10 @@ export function createDiskUsageScanner(
     lastOperationErrors = [];
 
     attachStagingTree(job, replaced);
-    markAncestorsIncomplete(staging.parent);
+    markAncestorsIncomplete(store.parent(staging));
     emitNow();
 
-    runJob(job, scanPath).catch(caught => {
+    runJob(job).catch(caught => {
       if (!isAbortError(caught)) {
         job.fatalError = toError(caught);
       }
@@ -474,46 +553,49 @@ export function createDiskUsageScanner(
   }
 
   function existingPathOrParent(pathKey: string): string | null {
-    if (pathKey === '.' || files.has(pathKey)) {
+    if (pathKey === '.' || resolvePathKey(pathKey) !== NONE) {
       return pathKey;
     }
 
     // A stale row can outlive its entry (for example, when an in-flight parent scan is
     // cancelled). Refresh its parent so the browser is reconciled with the filesystem.
     const parentPathKey = pathKeyForAbsolutePath(dirname(resolve(rootAbsolutePath, pathKey)));
-    return parentPathKey !== pathKey && files.has(parentPathKey) ? parentPathKey : null;
+    return parentPathKey !== pathKey && resolvePathKey(parentPathKey) !== NONE
+      ? parentPathKey
+      : null;
   }
 
   function restartSubtreeInJob(job: ScanJob, pathKey: string): boolean {
-    const replaced = files.get(pathKey);
-    const parent = replaced?.parent;
-    if (!replaced || !parent || !job.enqueueTask || job.isSettled) {
+    const replaced = resolvePathKey(pathKey);
+    const parent = replaced === NONE ? NONE : store.parent(replaced);
+    if (parent === NONE || !job.enqueueTask || job.isSettled) {
       return false;
     }
 
-    const index = parent.children.indexOf(replaced);
-    if (index < 0) {
-      return false;
-    }
-
-    const wasComplete = replaced.isComplete;
+    const wasComplete = hasFlags(replaced, COMPLETE);
+    const replacedSize = store.size(replaced);
     job.pendingDirectories = Math.max(
       0,
       job.pendingDirectories - countPendingDirectories(replaced),
     );
-    removeSubtreeFromIndex(replaced);
 
-    const staging = createMutableFileInfo(
-      replaced.absolutePath,
+    const staging = store.allocate(
+      store.name(replaced),
       parent,
-      replaced.isDirectory,
+      store.flags(replaced) & DIRECTORY,
+      0,
     );
-    parent.children[index] = staging;
-    addSizeToAncestors(parent, -replaced.size);
-    if (wasComplete) {
-      parent.pendingChildren += 1;
+    store.replaceChild(parent, replaced, staging);
+    releaseTree(replaced, true);
+    if (isDirectoryEntry(staging)) {
+      directoriesScanned += 1;
+    } else {
+      filesScanned += 1;
     }
-    addSubtreeToIndex(staging);
+    addSizeToAncestors(parent, -replacedSize);
+    if (wasComplete) {
+      addPendingChildren(parent, 1);
+    }
     job.refreshedRoots.add(staging);
     job.errors = job.errors.filter(error => !isSameOrDescendantPath(error.path, pathKey));
     lastOperationErrors = [];
@@ -521,43 +603,58 @@ export function createDiskUsageScanner(
     completedAt = null;
     job.enqueueTask({
       type: 'stat',
-      absolutePath: staging.absolutePath,
-      pathKey,
+      absolutePath: absolutePathForKey(pathKey),
+      name: '',
       parent,
+      parentGeneration: store.generation(parent),
       node: staging,
+      nodeGeneration: store.generation(staging),
     });
     return true;
   }
 
-  function attachStagingTree(job: ScanJob, replaced: MutableFileInfo): void {
-    removeSubtreeFromIndex(replaced);
+  function attachStagingTree(job: ScanJob, replaced: number): void {
+    const parent = store.parent(replaced);
+    countEntries(replaced, -1);
 
-    if (replaced.parent) {
-      const index = replaced.parent.children.indexOf(replaced);
-      job.oldIndex = index;
-      replaced.parent.children[index] = job.root;
-      job.root.parent = replaced.parent;
-      addSizeToAncestors(replaced.parent, -replaced.size);
+    if (parent !== NONE) {
+      store.replaceChild(parent, replaced, job.root);
+      addSizeToAncestors(parent, -store.size(replaced));
     } else {
       visibleRoot = job.root;
     }
+    if (isDirectoryEntry(job.root)) {
+      directoriesScanned += 1;
+    } else {
+      filesScanned += 1;
+    }
 
-    addSubtreeToIndex(job.root);
+    if (job.oldRoot === replaced) {
+      store.addFlags(replaced, DETACHED);
+    } else {
+      // A partial initial scan has no complete result worth restoring.
+      releaseTree(replaced, false);
+    }
+    structureVersion += 1;
   }
 
-  async function runJob(job: ScanJob, pathKey: string): Promise<void> {
+  async function runJob(job: ScanJob): Promise<void> {
+    const rootParent = store.parent(job.root);
     const tasks: ScanTask[] = [
       {
         type: 'stat',
-        absolutePath: job.root.absolutePath,
-        pathKey,
-        parent: job.root.parent,
+        absolutePath: absolutePathForKey(job.pathKey),
+        name: '',
+        parent: rootParent,
+        parentGeneration: rootParent === NONE ? 0 : store.generation(rootParent),
         node: job.root,
+        nodeGeneration: job.rootGeneration,
       },
     ];
     const openDirectories = new Set<Dir>();
-    const deferredOpenTasks: Extract<ScanTask, {type: 'open'}>[] = [];
-    let deferredOpenTaskIndex = 0;
+    // Directories waiting for a free handle, packed as `id * 256 + generation`.
+    const deferredOpens: number[] = [];
+    let deferredOpenIndex = 0;
     let taskIndex = 0;
 
     const enqueue = (task: ScanTask): void => {
@@ -566,33 +663,27 @@ export function createDiskUsageScanner(
       }
     };
 
-    const deferOpenTask = (task: Extract<ScanTask, {type: 'open'}>): void => {
-      deferredOpenTasks.push(task);
+    const deferOpen = (node: number, generation: number): void => {
+      deferredOpens.push(node * 256 + generation);
     };
 
     const enqueueNextDeferredOpenTask = (): boolean => {
       if (
         job.controller.signal.aborted ||
         activeJob !== job ||
-        openDirectories.size >= MAX_OPEN_DIRECTORIES
+        openDirectories.size >= MAX_OPEN_DIRECTORIES ||
+        deferredOpenIndex >= deferredOpens.length
       ) {
         return false;
       }
 
-      const deferred = deferredOpenTasks[deferredOpenTaskIndex];
-      if (!deferred) {
-        return false;
-      }
-      deferredOpenTaskIndex += 1;
+      const packed = deferredOpens[deferredOpenIndex++];
       // Keep the queue FIFO without retaining an ever-growing consumed prefix.
-      if (
-        deferredOpenTaskIndex > 1024 &&
-        deferredOpenTaskIndex * 2 > deferredOpenTasks.length
-      ) {
-        deferredOpenTasks.splice(0, deferredOpenTaskIndex);
-        deferredOpenTaskIndex = 0;
+      if (deferredOpenIndex > 1024 && deferredOpenIndex * 2 > deferredOpens.length) {
+        deferredOpens.splice(0, deferredOpenIndex);
+        deferredOpenIndex = 0;
       }
-      enqueue(deferred);
+      enqueue({type: 'open', node: Math.floor(packed / 256), generation: packed % 256});
       return true;
     };
 
@@ -614,7 +705,7 @@ export function createDiskUsageScanner(
         await directory.close().catch(() => {});
       }
       openDirectories.clear();
-      settleJob(job, pathKey);
+      settleJob(job);
     };
 
     const pump = (): void => {
@@ -636,14 +727,7 @@ export function createDiskUsageScanner(
         const task = tasks[taskIndex++];
         job.activeTasks += 1;
 
-        executeTask(
-          job,
-          task,
-          enqueue,
-          openDirectories,
-          deferOpenTask,
-          releaseDirectory,
-        )
+        executeTask(job, task, enqueue, openDirectories, deferOpen, releaseDirectory)
           .catch(caught => {
             if (!isAbortError(caught)) {
               const error = toError(caught);
@@ -669,7 +753,7 @@ export function createDiskUsageScanner(
 
     const onAbort = (): void => {
       taskIndex = tasks.length;
-      deferredOpenTaskIndex = deferredOpenTasks.length;
+      deferredOpenIndex = deferredOpens.length;
       pump();
     };
     job.enqueueTask = task => {
@@ -690,34 +774,36 @@ export function createDiskUsageScanner(
     task: ScanTask,
     enqueue: (task: ScanTask) => void,
     openDirectories: Set<Dir>,
-    deferOpenTask: (task: Extract<ScanTask, {type: 'open'}>) => void,
+    deferOpen: (node: number, generation: number) => void,
     releaseDirectory: (directory: Dir) => void,
   ): Promise<void> {
-    if (task.type === 'read' && !isNodeActive(job, task.node)) {
+    if (task.type === 'read' && !isNodeActive(job, task.node, task.generation)) {
       // The directory was ignored or replaced while this read was queued; release its handle.
       releaseDirectory(task.directory);
       await task.directory.close().catch(() => {});
       throw new TraversalAbortedError();
     }
-    throwIfNodeInactive(job, task.type === 'stat' ? task.node ?? task.parent : task.node);
 
     if (task.type === 'stat') {
+      throwIfStatTaskInactive(job, task);
       await executeStatTask(job, task, enqueue);
       return;
     }
 
+    throwIfNodeInactive(job, task.node, task.generation);
+
     if (task.type === 'open') {
       if (openDirectories.size >= MAX_OPEN_DIRECTORIES) {
-        deferOpenTask(task);
+        deferOpen(task.node, task.generation);
         return;
       }
 
       let directory: Dir | null = null;
       try {
-        directory = await fileSystem.opendir(task.node.absolutePath);
+        directory = await fileSystem.opendir(absolutePathFor(task.node));
         openDirectories.add(directory);
-        throwIfNodeInactive(job, task.node);
-        enqueue({type: 'read', node: task.node, directory});
+        throwIfNodeInactive(job, task.node, task.generation);
+        enqueue({type: 'read', node: task.node, generation: task.generation, directory});
       } catch (caught) {
         if (directory) {
           releaseDirectory(directory);
@@ -726,31 +812,21 @@ export function createDiskUsageScanner(
         if (isAbortError(caught)) {
           throw caught;
         }
-        const error = toError(caught);
-        if (task.node === job.root && job.oldParent && isNotFoundError(error)) {
-          job.rootWasDeleted = true;
-        } else if (removeDeletedRefreshedRoot(job, task.node, error)) {
-          job.pendingDirectories = Math.max(0, job.pendingDirectories - 1);
-          return;
-        } else {
-          recordError(job, task.node, error);
-        }
-        task.node.entriesRead = true;
-        job.pendingDirectories = Math.max(0, job.pendingDirectories - 1);
-        maybeCompleteNode(job, task.node);
+        throwIfNodeInactive(job, task.node, task.generation);
+        handleDirectoryFailure(job, task.node, toError(caught));
       }
       return;
     }
 
     try {
-      const dirent = await task.directory.read();
-      throwIfNodeInactive(job, task.node);
+      const entry = await task.directory.read();
+      throwIfNodeInactive(job, task.node, task.generation);
 
-      if (!dirent) {
+      if (!entry) {
         releaseDirectory(task.directory);
         await task.directory.close().catch(() => {});
-        throwIfNodeInactive(job, task.node);
-        task.node.entriesRead = true;
+        throwIfNodeInactive(job, task.node, task.generation);
+        store.addFlags(task.node, ENTRIES_READ);
         job.pendingDirectories = Math.max(0, job.pendingDirectories - 1);
         maybeCompleteNode(job, task.node);
         scheduleNotification();
@@ -759,12 +835,19 @@ export function createDiskUsageScanner(
 
       const directoryPath = task.directory.path;
       const absolutePath = directoryPath.endsWith(sep)
-        ? directoryPath + dirent.name
-        : directoryPath + sep + dirent.name;
-      const childKey = pathKeyForAbsolutePath(absolutePath);
-      if (!ignoredPaths.has(childKey)) {
-        task.node.pendingChildren += 1;
-        enqueue({type: 'stat', absolutePath, pathKey: childKey, parent: task.node});
+        ? directoryPath + entry.name
+        : directoryPath + sep + entry.name;
+      if (!ignoredPaths.size || !ignoredPaths.has(pathKeyForAbsolutePath(absolutePath))) {
+        addPendingChildren(task.node, 1);
+        enqueue({
+          type: 'stat',
+          absolutePath,
+          name: entry.name,
+          parent: task.node,
+          parentGeneration: task.generation,
+          node: NONE,
+          nodeGeneration: 0,
+        });
       }
       enqueue(task);
     } catch (caught) {
@@ -773,19 +856,23 @@ export function createDiskUsageScanner(
       if (isAbortError(caught)) {
         throw caught;
       }
-      const error = toError(caught);
-      if (task.node === job.root && job.oldParent && isNotFoundError(error)) {
-        job.rootWasDeleted = true;
-      } else if (removeDeletedRefreshedRoot(job, task.node, error)) {
-        job.pendingDirectories = Math.max(0, job.pendingDirectories - 1);
-        return;
-      } else {
-        recordError(job, task.node, error);
-      }
-      task.node.entriesRead = true;
-      job.pendingDirectories = Math.max(0, job.pendingDirectories - 1);
-      maybeCompleteNode(job, task.node);
+      throwIfNodeInactive(job, task.node, task.generation);
+      handleDirectoryFailure(job, task.node, toError(caught));
     }
+  }
+
+  function handleDirectoryFailure(job: ScanJob, node: number, error: Error): void {
+    if (node === job.root && job.oldParent !== NONE && isNotFoundError(error)) {
+      job.rootWasDeleted = true;
+    } else if (removeDeletedRefreshedRoot(job, node, error)) {
+      job.pendingDirectories = Math.max(0, job.pendingDirectories - 1);
+      return;
+    } else {
+      recordError(job, node, error);
+    }
+    store.addFlags(node, ENTRIES_READ);
+    job.pendingDirectories = Math.max(0, job.pendingDirectories - 1);
+    maybeCompleteNode(job, node);
   }
 
   async function executeStatTask(
@@ -795,12 +882,14 @@ export function createDiskUsageScanner(
   ): Promise<void> {
     // A listed entry can be ignored before or while it is stat-ed.
     const skipIfIgnored = (): boolean => {
-      if (task.node || !ignoredPaths.has(task.pathKey)) {
+      if (
+        task.node !== NONE ||
+        !ignoredPaths.size ||
+        !ignoredPaths.has(pathKeyForAbsolutePath(task.absolutePath))
+      ) {
         return false;
       }
-      if (task.parent) {
-        childFinished(job, task.parent);
-      }
+      childFinished(job, task.parent);
       return true;
     };
     if (skipIfIgnored()) {
@@ -810,7 +899,7 @@ export function createDiskUsageScanner(
     let stats: FileSystemStats;
     try {
       stats = await fileSystem.lstat(task.absolutePath);
-      throwIfNodeInactive(job, task.node ?? task.parent);
+      throwIfStatTaskInactive(job, task);
       if (skipIfIgnored()) {
         return;
       }
@@ -818,70 +907,54 @@ export function createDiskUsageScanner(
       if (isAbortError(caught)) {
         throw caught;
       }
-      if (skipIfIgnored()) {
-        return;
-      }
-
-      const error = toError(caught);
-      const pathKey = task.pathKey;
-      if (task.node === job.root && job.oldParent && isNotFoundError(error)) {
-        job.rootWasDeleted = true;
-        task.node.isComplete = true;
-      } else if (task.node && removeDeletedRefreshedRoot(job, task.node, error)) {
-        return;
-      } else {
-        recordErrorAtPath(job, pathKey, error);
-      }
-      if (task.node === job.root && !job.rootWasDeleted) {
-        job.fatalError = error;
-        task.node.error = error;
-        task.node.isComplete = true;
-      } else if (!task.node && task.parent) {
-        childFinished(job, task.parent);
-      } else if (task.node && job.refreshedRoots.has(task.node)) {
-        task.node.error = error;
-        task.node.isComplete = true;
-        job.refreshedRoots.delete(task.node);
-        if (task.node.parent) {
-          childFinished(job, task.node.parent);
-        }
+      throwIfStatTaskInactive(job, task);
+      if (!skipIfIgnored()) {
+        handleStatFailure(job, task, toError(caught));
       }
       return;
     }
 
     const isDirectory = stats.isDirectory();
     const ownSize = sizeOnDisk(stats);
-    const node: MutableFileInfo =
-      task.node ??
-      (isDirectory
-        ? new DirectoryInfoNode(task.pathKey, task.parent!)
-        : new CompletedFileInfoNode(task.pathKey, ownSize));
+    let node = task.node;
+    const parent = node !== NONE ? store.parent(node) : task.parent;
 
-    if (task.node) {
+    if (node !== NONE) {
       setNodeType(node, isDirectory);
-      node.size = ownSize;
-      node.entriesRead = !isDirectory;
-      node.isComplete = !isDirectory;
-      node.error = null;
-    } else if (isDirectory) {
-      node.size = ownSize;
-    }
-
-    const parent = task.node ? node.parent : task.parent;
-    if (!task.node && parent) {
-      if (parent.children === emptyChildren) {
-        parent.children = [];
+      clearNodeState(node);
+      store.setSize(node, ownSize);
+      if (!isDirectory) {
+        store.addFlags(node, COMPLETE | ENTRIES_READ);
       }
-      parent.children.push(node);
-      addSubtreeToIndex(node);
+    } else {
+      node = store.allocate(
+        task.name,
+        parent,
+        isDirectory ? DIRECTORY : COMPLETE | ENTRIES_READ,
+        ownSize,
+      );
+      store.prependChild(parent, node);
+      if (isDirectory) {
+        directoriesScanned += 1;
+      } else {
+        filesScanned += 1;
+      }
     }
 
-    addSizeToAncestors(parent, ownSize);
+    const aliasOf = isDirectory ? claimDirectoryIdentity(stats, node) : NONE;
+    if (aliasOf !== NONE) {
+      // The same directory is already counted elsewhere; record where, and do not descend.
+      store.setSize(node, 0);
+      store.addFlags(node, ALIAS | COMPLETE | ENTRIES_READ);
+      aliasIdentities.set(node, identityScratch.slice());
+    } else {
+      addSizeToAncestors(parent, ownSize);
+    }
 
-    if (isDirectory) {
+    if (isDirectory && aliasOf === NONE) {
       job.pendingDirectories += 1;
-      enqueue({type: 'open', node});
-    } else if (node !== job.root && parent) {
+      enqueue({type: 'open', node, generation: store.generation(node)});
+    } else if (node !== job.root && parent !== NONE) {
       job.refreshedRoots.delete(node);
       childFinished(job, parent);
     }
@@ -889,44 +962,79 @@ export function createDiskUsageScanner(
     scheduleNotification();
   }
 
-  function maybeCompleteNode(job: ScanJob, node: MutableFileInfo): void {
-    if (node.isComplete || !node.entriesRead || node.pendingChildren !== 0) {
+  function handleStatFailure(
+    job: ScanJob,
+    task: Extract<ScanTask, {type: 'stat'}>,
+    error: Error,
+  ): void {
+    const node = task.node;
+    let report: DiskUsageError | null = null;
+    if (node === job.root && job.oldParent !== NONE && isNotFoundError(error)) {
+      job.rootWasDeleted = true;
+      store.addFlags(node, COMPLETE);
+    } else if (node !== NONE && removeDeletedRefreshedRoot(job, node, error)) {
       return;
+    } else {
+      report = recordErrorAtPath(job, pathKeyForAbsolutePath(task.absolutePath), error);
     }
 
-    node.children = node.children.length ? node.children.slice() : emptyChildren;
-    node.isComplete = true;
-    job.refreshedRoots.delete(node);
-    if (node !== job.root && node.parent) {
-      childFinished(job, node.parent);
+    if (node === job.root && !job.rootWasDeleted) {
+      job.fatalError = error;
+      if (report) {
+        setNodeError(node, report);
+      }
+      store.addFlags(node, COMPLETE);
+    } else if (node === NONE && task.parent !== NONE) {
+      childFinished(job, task.parent);
+    } else if (node !== NONE && job.refreshedRoots.has(node)) {
+      if (report) {
+        setNodeError(node, report);
+      }
+      store.addFlags(node, COMPLETE);
+      job.refreshedRoots.delete(node);
+      const parent = store.parent(node);
+      if (parent !== NONE) {
+        childFinished(job, parent);
+      }
     }
   }
 
-  function removeDeletedRefreshedRoot(
-    job: ScanJob,
-    node: MutableFileInfo,
-    error: Error,
-  ): boolean {
-    const parent = node.parent;
-    if (!parent || !job.refreshedRoots.has(node) || !isNotFoundError(error)) {
+  function maybeCompleteNode(job: ScanJob, node: number): void {
+    const flags = store.flags(node);
+    if (flags & COMPLETE || !(flags & ENTRIES_READ) || pendingChildrenOf(node) !== 0) {
+      return;
+    }
+
+    store.addFlags(node, COMPLETE);
+    job.refreshedRoots.delete(node);
+    const parent = store.parent(node);
+    if (node !== job.root && parent !== NONE) {
+      childFinished(job, parent);
+    }
+  }
+
+  function removeDeletedRefreshedRoot(job: ScanJob, node: number, error: Error): boolean {
+    const parent = store.parent(node);
+    if (parent === NONE || !job.refreshedRoots.has(node) || !isNotFoundError(error)) {
       return false;
     }
 
-    removeSubtreeFromIndex(node);
-    parent.children = parent.children.filter(child => child !== node);
-    addSizeToAncestors(parent, -node.size);
+    const size = store.size(node);
+    store.unlinkChild(parent, node);
+    releaseTree(node, true);
+    addSizeToAncestors(parent, -size);
     job.refreshedRoots.delete(node);
     childFinished(job, parent);
     scheduleNotification();
     return true;
   }
 
-  function childFinished(job: ScanJob, parent: MutableFileInfo): void {
-    parent.pendingChildren = Math.max(0, parent.pendingChildren - 1);
+  function childFinished(job: ScanJob, parent: number): void {
+    addPendingChildren(parent, -1);
     maybeCompleteNode(job, parent);
   }
 
-  function settleJob(job: ScanJob, pathKey: string): void {
+  function settleJob(job: ScanJob): void {
     if (job.isSettled) {
       return;
     }
@@ -938,14 +1046,15 @@ export function createDiskUsageScanner(
     if (job.isDiscarded) {
       restoreJobAncestors(job);
       lastOperationErrors = [];
-    } else if (wasAborted || (job.fatalError && job.oldRoot)) {
+    } else if (wasAborted || (job.fatalError && job.oldRoot !== NONE)) {
       rollbackJob(job);
       lastOperationErrors = job.fatalError ? [...job.errors] : [];
     } else if (job.rootWasDeleted) {
-      commitDeletedJob(job, pathKey);
+      commitDeletedJob(job);
     } else {
-      commitJob(job, pathKey);
+      commitJob(job);
     }
+    releaseOldRoot(job);
 
     if (activeJob === job) {
       activeJob = null;
@@ -957,9 +1066,19 @@ export function createDiskUsageScanner(
       }
     }
 
+    job.refreshedRoots.clear();
+    job.ancestorCompletion.clear();
+    structureVersion += 1;
     notifyIdleWaiters(job);
     job.resolveDone();
     emitNow();
+  }
+
+  function releaseOldRoot(job: ScanJob): void {
+    if (job.oldRoot !== NONE) {
+      releaseTree(job.oldRoot, false);
+      job.oldRoot = NONE;
+    }
   }
 
   function notifyIdleWaiters(job: ScanJob): void {
@@ -1000,55 +1119,69 @@ export function createDiskUsageScanner(
     emitNow();
   }
 
-  function commitJob(job: ScanJob, pathKey: string): void {
+  function commitJob(job: ScanJob): void {
     restoreJobAncestors(job);
 
     committedErrors = committedErrors.filter(
-      error => !isSameOrDescendantPath(error.path, pathKey),
+      error => !isSameOrDescendantPath(error.path, job.pathKey),
     );
     committedErrors.push(...job.errors);
     lastOperationErrors = [];
   }
 
-  function commitDeletedJob(job: ScanJob, pathKey: string): void {
+  function commitDeletedJob(job: ScanJob): void {
     const parent = job.oldParent;
-    if (!parent) {
+    if (parent === NONE) {
       // The scanner root cannot be removed from a parent tree. Root failures remain errors.
       rollbackJob(job);
       return;
     }
 
-    removeSubtreeFromIndex(job.root);
-    const index = parent.children.indexOf(job.root);
-    if (index >= 0) {
-      parent.children.splice(index, 1);
+    if (store.isLive(job.root, job.rootGeneration)) {
+      const size = store.size(job.root);
+      const wasLinked = store.unlinkChild(parent, job.root);
+      releaseTree(job.root, wasLinked);
+      if (wasLinked) {
+        addSizeToAncestors(parent, -size);
+      }
     }
-    addSizeToAncestors(parent, -job.root.size);
     restoreJobAncestors(job);
 
     committedErrors = committedErrors.filter(
-      error => !isSameOrDescendantPath(error.path, pathKey),
+      error => !isSameOrDescendantPath(error.path, job.pathKey),
     );
     lastOperationErrors = [];
   }
 
   function rollbackJob(job: ScanJob): void {
-    if (!job.oldRoot) {
+    const oldRoot = job.oldRoot;
+    if (oldRoot === NONE) {
       // An initial scan has no previous complete tree to restore. Keep its partial result visible.
       return;
     }
+    job.oldRoot = NONE;
 
-    removeSubtreeFromIndex(job.root);
-    if (job.oldParent) {
-      const currentIndex = job.oldParent.children.indexOf(job.root);
-      const index = currentIndex >= 0 ? currentIndex : job.oldIndex;
-      job.oldParent.children[index] = job.oldRoot;
-      addSizeToAncestors(job.oldParent, job.oldRoot.size - job.root.size);
+    const staging = job.root;
+    const stagingIsLive = store.isLive(staging, job.rootGeneration);
+    store.clearFlags(oldRoot, DETACHED);
+    if (job.oldParent !== NONE) {
+      const wasLinked = stagingIsLive && store.replaceChild(job.oldParent, staging, oldRoot);
+      if (!wasLinked) {
+        store.prependChild(job.oldParent, oldRoot);
+      }
+      const stagingSize = wasLinked ? store.size(staging) : 0;
+      if (stagingIsLive) {
+        releaseTree(staging, wasLinked);
+      }
+      addSizeToAncestors(job.oldParent, store.size(oldRoot) - stagingSize);
       restoreJobAncestors(job);
     } else {
-      visibleRoot = job.oldRoot;
+      visibleRoot = oldRoot;
+      if (stagingIsLive) {
+        releaseTree(staging, true);
+      }
     }
-    addSubtreeToIndex(job.oldRoot);
+    countEntries(oldRoot, 1);
   }
 
   function cancelJob(job: ScanJob, rollbackImmediately: boolean): void {
@@ -1057,10 +1190,8 @@ export function createDiskUsageScanner(
     }
 
     job.controller.abort();
-    if (rollbackImmediately && job.oldRoot && activeJob === job) {
+    if (rollbackImmediately && job.oldRoot !== NONE && activeJob === job) {
       rollbackJob(job);
-      // Prevent settleJob from rolling the same tree back twice.
-      job.oldRoot = null;
     }
   }
 
@@ -1110,7 +1241,7 @@ export function createDiskUsageScanner(
 
     // Ignoring prunes the entry and its descendants; the rest of an active scan continues.
     // Entries not yet listed are skipped when they are read, and queued or in-flight work
-    // under a removed node is dropped because the node is no longer indexed.
+    // under a removed entry is dropped because its generation no longer matches.
     ignoredPaths.add(pathKey);
     const isOutsideIgnored = (error: DiskUsageError) =>
       !isSameOrDescendantPath(error.path, pathKey);
@@ -1120,49 +1251,50 @@ export function createDiskUsageScanner(
     const job = activeJob;
     if (job) {
       job.errors = job.errors.filter(isOutsideIgnored);
-      if (!job.isSettled && isSameOrDescendantPath(pathKeyForNode(job.root), pathKey)) {
+      if (!job.isSettled && isSameOrDescendantPath(job.pathKey, pathKey)) {
         // Everything this job was scanning is ignored, so there is nothing to restore.
         job.isDiscarded = true;
-        job.oldRoot = null;
+        releaseOldRoot(job);
         job.controller.abort();
       }
     }
 
-    const info = files.get(pathKey);
-    if (info) {
+    const info = resolvePathKey(pathKey);
+    if (info !== NONE) {
       removeIgnoredNode(info, job);
     }
     job?.dispatch?.();
     emitNow();
   }
 
-  function removeIgnoredNode(info: MutableFileInfo, job: ScanJob | null): void {
-    const parent = info.parent;
+  function removeIgnoredNode(info: number, job: ScanJob | null): void {
+    const parent = store.parent(info);
+    if (parent === NONE) {
+      return;
+    }
     if (job) {
       job.pendingDirectories = Math.max(
         0,
         job.pendingDirectories - countPendingDirectories(info),
       );
-      job.refreshedRoots.delete(info);
-    }
-    removeSubtreeFromIndex(info);
-    if (!parent) {
-      return;
     }
 
-    parent.children = parent.children.filter(child => child !== info);
-    for (let ancestor: MutableFileInfo | null = parent; ancestor; ancestor = ancestor.parent) {
-      ancestor.size -= info.size;
+    const wasComplete = hasFlags(info, COMPLETE);
+    const size = store.size(info);
+    store.unlinkChild(parent, info);
+    releaseTree(info, true);
+    for (let ancestor = parent; ancestor !== NONE; ancestor = store.parent(ancestor)) {
+      store.addSize(ancestor, -size);
     }
 
     // An incomplete child is counted in its parent's pending children, except for a job root.
-    if (!info.isComplete && !job?.isDiscarded) {
+    if (!wasComplete && !job?.isDiscarded) {
       const parentIsInJob =
-        job && isSameOrDescendantPath(pathKeyForNode(parent), pathKeyForNode(job.root));
+        job !== null && isSameOrDescendantPath(pathKeyFor(parent), job.pathKey);
       if (parentIsInJob) {
         childFinished(job, parent);
       } else {
-        parent.pendingChildren = Math.max(0, parent.pendingChildren - 1);
+        addPendingChildren(parent, -1);
       }
     }
   }
@@ -1189,8 +1321,212 @@ export function createDiskUsageScanner(
     return relativePath || '.';
   }
 
-  function pathKeyForNode(node: MutableFileInfo): string {
-    return node.path === rootAbsolutePath ? '.' : node.path;
+  // Views
+
+  class EntryInfo implements FileInfo {
+    private cachedName: string | undefined;
+    private cachedPath: string | undefined;
+    private cachedError: Error | null | undefined;
+    private readonly isRoot: boolean;
+
+    constructor(
+      private readonly views: ReportViews,
+      readonly id: number,
+      readonly generation: number,
+      /** The parent's path key, or the entry's own path key when `knownPath` is set. */
+      private readonly pathHint: string | undefined,
+      private readonly knownPath: boolean,
+    ) {
+      this.isRoot = store.parent(id) === NONE;
+    }
+
+    private get isLive(): boolean {
+      return store.isLive(this.id, this.generation);
+    }
+
+    /** Path key relative to the scan root; `.` for the root. */
+    get key(): string {
+      return this.isRoot ? '.' : this.path;
+    }
+
+    get name(): string {
+      if (this.cachedName === undefined) {
+        this.cachedName = this.isRoot ? rootName : this.isLive ? store.name(this.id) : '';
+      }
+      return this.cachedName;
+    }
+
+    get path(): string {
+      if (this.cachedPath === undefined) {
+        if (this.isRoot) {
+          this.cachedPath = rootAbsolutePath;
+        } else if (this.knownPath && this.pathHint !== undefined) {
+          this.cachedPath = this.pathHint;
+        } else if (this.pathHint !== undefined) {
+          this.cachedPath = this.pathHint === '.' ? this.name : this.pathHint + sep + this.name;
+        } else {
+          this.cachedPath = this.isLive ? pathKeyFor(this.id) : '';
+        }
+      }
+      return this.cachedPath;
+    }
+
+    get absolutePath(): string {
+      return this.isRoot ? rootAbsolutePath : absolutePathForKey(this.path);
+    }
+
+    get size(): number {
+      return this.isLive ? store.size(this.id) : 0;
+    }
+
+    get isDirectory(): boolean {
+      return this.isLive && isDirectoryEntry(this.id);
+    }
+
+    get isComplete(): boolean {
+      return !this.isLive || hasFlags(this.id, COMPLETE);
+    }
+
+    get error(): Error | null {
+      if (!this.isLive || !hasFlags(this.id, HAS_ERROR)) {
+        return null;
+      }
+      if (this.cachedError === undefined) {
+        const report = nodeErrors.get(this.id);
+        this.cachedError = report ? toFileError(report) : null;
+      }
+      return this.cachedError;
+    }
+
+    get aliasOf(): string | null {
+      if (!this.isLive || !hasFlags(this.id, ALIAS)) {
+        return null;
+      }
+      const identity = aliasIdentities.get(this.id);
+      const owner = identity ? identities.find(identity) : NONE;
+      return owner === NONE ? null : pathKeyFor(owner);
+    }
+
+    get childCount(): number {
+      if (!this.isLive) {
+        return 0;
+      }
+      let count = 0;
+      for (
+        let child = store.firstChild(this.id);
+        child !== NONE;
+        child = store.nextSibling(child)
+      ) {
+        count += 1;
+      }
+      return count;
+    }
+
+    get children(): FileInfo[] {
+      if (!this.isLive || !isDirectoryEntry(this.id)) {
+        return [];
+      }
+      const key = this.key;
+      const children: FileInfo[] = [];
+      for (
+        let child = store.firstChild(this.id);
+        child !== NONE;
+        child = store.nextSibling(child)
+      ) {
+        children.push(this.views.viewFor(child, key, false));
+      }
+      return children;
+    }
+
+    refresh(): Promise<void> {
+      if (!this.isRoot && !this.path) {
+        return Promise.resolve();
+      }
+      return refreshPath(this.absolutePath);
+    }
+
+    recalculate(): void {
+      // Sizes are updated incrementally by the active subtree scan.
+    }
+
+    abort(): void {
+      abortScan();
+    }
+
+    ignore(): void {
+      if (!this.isRoot && this.path) {
+        ignorePath(this.absolutePath);
+      }
+    }
+  }
+
+  /** Per-report view cache, so a report returns the same view for the same entry. */
+  class ReportViews {
+    private readonly views = new Map<number, EntryInfo>();
+
+    viewFor(id: number, pathHint?: string, knownPath = false): EntryInfo {
+      const generation = store.generation(id);
+      let view = this.views.get(id);
+      if (!view || view.generation !== generation) {
+        view = new EntryInfo(this, id, generation, pathHint, knownPath);
+        this.views.set(id, view);
+      }
+      return view;
+    }
+  }
+
+  class EntryIndex implements FileIndex {
+    constructor(private readonly views: ReportViews) {}
+
+    get size(): number {
+      return filesScanned + directoriesScanned;
+    }
+
+    get(path: string): FileInfo | undefined {
+      const id = resolvePathKey(path);
+      if (id === NONE) {
+        return undefined;
+      }
+      return path === '.' ? this.views.viewFor(id) : this.views.viewFor(id, path, true);
+    }
+
+    has(path: string): boolean {
+      return resolvePathKey(path) !== NONE;
+    }
+
+    *entries(): IterableIterator<[string, FileInfo]> {
+      const stack: EntryInfo[] = [this.views.viewFor(visibleRoot)];
+      while (stack.length) {
+        const view = stack.pop()!;
+        yield [view.key, view];
+        const children = view.children as EntryInfo[];
+        for (let index = children.length - 1; index >= 0; index--) {
+          stack.push(children[index]);
+        }
+      }
+    }
+
+    *keys(): IterableIterator<string> {
+      for (const [key] of this.entries()) {
+        yield key;
+      }
+    }
+
+    *values(): IterableIterator<FileInfo> {
+      for (const [, info] of this.entries()) {
+        yield info;
+      }
+    }
+
+    [Symbol.iterator](): IterableIterator<[string, FileInfo]> {
+      return this.entries();
+    }
+
+    forEach(callback: (info: FileInfo, path: string) => void): void {
+      for (const [key, info] of this.entries()) {
+        callback(info, key);
+      }
+    }
   }
 
   function getReport(): ProgressReport {
@@ -1199,21 +1535,29 @@ export function createDiskUsageScanner(
       errors.push(...activeJob.errors);
     }
     const elapsedCompletedAt = completedAt;
+    const views = new ReportViews();
+    const root = visibleRoot;
 
     return {
-      path: visibleRoot.path,
-      absolutePath: visibleRoot.absolutePath,
-      name: visibleRoot.name,
-      size: visibleRoot.size,
-      isDirectory: visibleRoot.isDirectory,
-      isComplete: !activeJob && visibleRoot.isComplete,
-      children: visibleRoot.children,
+      path: rootAbsolutePath,
+      absolutePath: rootAbsolutePath,
+      name: rootName,
+      size: store.size(root),
+      isDirectory: isDirectoryEntry(root),
+      isComplete: !activeJob && hasFlags(root, COMPLETE),
+      aliasOf: null,
+      get childCount() {
+        return views.viewFor(root).childCount;
+      },
+      get children() {
+        return views.viewFor(root).children;
+      },
       refresh: () => refreshPath('.'),
       recalculate() {},
       abort: abortScan,
       ignore() {},
       rootPath: rootAbsolutePath,
-      files: files as unknown as Map<string, FileInfo>,
+      files: new EntryIndex(views),
       errors,
       error: errors.length ? new Error(errors[0].message) : null,
       filesScanned,
@@ -1225,88 +1569,195 @@ export function createDiskUsageScanner(
       startedAt,
       completedAt: elapsedCompletedAt,
       elapsedMs: (elapsedCompletedAt ?? clock.now()) - startedAt,
+      largest: count => largestEntries(views, count),
     };
   }
 
-  function setNodeType(node: MutableFileInfo, isDirectory: boolean): void {
-    if (node.isDirectory === isDirectory) {
+  // Rankings
+
+  function largestEntries(views: ReportViews, count: number): LargestCandidates {
+    const limit = Math.max(0, Math.floor(count));
+    if (limit === 0) {
+      return {directories: [], files: []};
+    }
+
+    const now = clock.now();
+    const isScanning = activeJob !== null;
+    const cached = largestCache;
+    const isFresh =
+      cached !== null &&
+      cached.limit === limit &&
+      cached.version === structureVersion &&
+      (isScanning
+        ? now - cached.computedAt < LARGEST_REFRESH_MS
+        : !cached.wasScanning);
+    const result = isFresh ? cached : computeLargest(limit);
+    if (!isFresh) {
+      largestCache = {...result, limit, version: structureVersion, computedAt: now, wasScanning: isScanning};
+    }
+
+    const toEntries = (candidates: Candidate[]): [string, FileInfo][] =>
+      candidates
+        .filter(candidate => store.isLive(candidate.id, candidate.generation))
+        .map(candidate => {
+          const path = candidatePath(candidate);
+          return [path, views.viewFor(candidate.id, path, true)];
+        });
+    return {directories: toEntries(result.directories), files: toEntries(result.files)};
+  }
+
+  function candidatePath(candidate: Candidate): string {
+    return (candidate.path ??= pathKeyFor(candidate.id));
+  }
+
+  /**
+   * Select directories by the space they account for beyond their largest child directory.
+   * This prevents a single large subtree from occupying the list once for every ancestor,
+   * while still allowing branching ancestors to rank for the other space they contain.
+   */
+  function computeLargest(limit: number): {directories: Candidate[]; files: Candidate[]} {
+    const directories: Candidate[] = [];
+    const files: Candidate[] = [];
+    let currentId = NONE;
+    let currentPath: string | null = null;
+    const pathOfCurrent = (id: number): string => {
+      if (currentId !== id) {
+        currentId = id;
+        currentPath = null;
+      }
+      return (currentPath ??= pathKeyFor(id));
+    };
+    // Whether the entry ranks before `candidate`: larger selection size, then larger total
+    // size, then path order.
+    const ranksBefore = (
+      id: number,
+      size: number,
+      selectionSize: number,
+      candidate: Candidate,
+    ): boolean => {
+      if (selectionSize !== candidate.selectionSize) {
+        return selectionSize > candidate.selectionSize;
+      }
+      if (size !== candidate.size) {
+        return size > candidate.size;
+      }
+      return pathOfCurrent(id).localeCompare(candidatePath(candidate)) < 0;
+    };
+    const insert = (list: Candidate[], id: number, size: number, selectionSize: number): void => {
+      if (list.length === limit && !ranksBefore(id, size, selectionSize, list[limit - 1])) {
+        return;
+      }
+      let index = 0;
+      while (index < list.length && !ranksBefore(id, size, selectionSize, list[index])) {
+        index += 1;
+      }
+      list.splice(index, 0, {
+        id,
+        generation: store.generation(id),
+        size,
+        selectionSize,
+        path: currentId === id ? currentPath : null,
+      });
+      if (list.length > limit) {
+        list.pop();
+      }
+    };
+
+    store.forEachInSubtree(visibleRoot, id => {
+      if (id === visibleRoot) {
+        return;
+      }
+      const flags = store.flags(id);
+      const size = store.size(id);
+      if (!(flags & DIRECTORY)) {
+        insert(files, id, size, size);
+        return;
+      }
+      if (flags & ALIAS) {
+        return;
+      }
+      let largestChildSize = 0;
+      for (let child = store.firstChild(id); child !== NONE; child = store.nextSibling(child)) {
+        const childSize = store.size(child);
+        if (isDirectoryEntry(child) && childSize > largestChildSize) {
+          largestChildSize = childSize;
+        }
+      }
+      const selectionSize = Math.max(0, size - largestChildSize);
+      if (selectionSize > 0) {
+        insert(directories, id, size, selectionSize);
+      }
+    });
+
+    // Selection uses the non-redundant size, but the report remains ordered by total size.
+    directories.sort(
+      (a, b) => b.size - a.size || candidatePath(a).localeCompare(candidatePath(b)),
+    );
+    return {directories, files};
+  }
+
+  // Tree bookkeeping
+
+  function setNodeType(id: number, isDirectory: boolean): void {
+    if (isDirectoryEntry(id) === isDirectory) {
       return;
     }
 
-    if (node.isDirectory) {
-      directoriesScanned -= 1;
-      filesScanned += 1;
-    } else {
+    if (isDirectory) {
       filesScanned -= 1;
       directoriesScanned += 1;
+      store.addFlags(id, DIRECTORY);
+    } else {
+      directoriesScanned -= 1;
+      filesScanned += 1;
+      store.clearFlags(id, DIRECTORY);
     }
-    node.isDirectory = isDirectory;
   }
 
-  function addSubtreeToIndex(node: MutableFileInfo): void {
-    const key = pathKeyForNode(node);
-    if (!files.has(key)) {
-      if (node.isDirectory) {
-        directoriesScanned += 1;
-      } else {
-        filesScanned += 1;
+  function addSizeToAncestors(id: number, delta: number): void {
+    for (let current = id; current !== NONE; current = store.parent(current)) {
+      store.addSize(current, delta);
+      store.clearFlags(current, COMPLETE);
+    }
+  }
+
+  function countPendingDirectories(root: number): number {
+    let count = 0;
+    store.forEachInSubtree(root, id => {
+      if ((store.flags(id) & (DIRECTORY | ENTRIES_READ)) === DIRECTORY) {
+        count += 1;
       }
-    }
-    files.set(key, node);
-    for (const child of node.children) {
-      addSubtreeToIndex(child);
-    }
-  }
-
-  function removeSubtreeFromIndex(node: MutableFileInfo): void {
-    for (const child of node.children) {
-      removeSubtreeFromIndex(child);
-    }
-    const key = pathKeyForNode(node);
-    if (files.get(key) === node) {
-      files.delete(key);
-      if (node.isDirectory) {
-        directoriesScanned = Math.max(0, directoriesScanned - 1);
-      } else {
-        filesScanned = Math.max(0, filesScanned - 1);
-      }
-    }
-  }
-
-  function addSizeToAncestors(node: MutableFileInfo | null, delta: number): void {
-    for (let current = node; current; current = current.parent) {
-      current.size += delta;
-      current.isComplete = false;
-    }
-  }
-
-  function countPendingDirectories(node: MutableFileInfo): number {
-    let count = node.isDirectory && !node.entriesRead ? 1 : 0;
-    for (const child of node.children) {
-      count += countPendingDirectories(child);
-    }
+    });
     return count;
   }
 
   function restoreJobAncestors(job: ScanJob): void {
-    for (const [ancestor, wasComplete] of job.ancestorCompletion) {
-      ancestor.isComplete = wasComplete;
+    for (const [ancestor, packed] of job.ancestorCompletion) {
+      if (!store.isLive(ancestor, packed >> 1)) {
+        continue;
+      }
+      if (packed & 1) {
+        store.addFlags(ancestor, COMPLETE);
+      } else {
+        store.clearFlags(ancestor, COMPLETE);
+      }
     }
   }
 
-  function markAncestorsIncomplete(node: MutableFileInfo | null): void {
-    for (let current = node; current; current = current.parent) {
-      current.isComplete = false;
+  function markAncestorsIncomplete(id: number): void {
+    for (let current = id; current !== NONE; current = store.parent(current)) {
+      store.clearFlags(current, COMPLETE);
     }
   }
 
-  function recordError(job: ScanJob, info: MutableFileInfo, error: Error): void {
-    info.error = error;
-    recordErrorAtPath(job, pathKeyForNode(info), error);
+  function recordError(job: ScanJob, id: number, error: Error): void {
+    setNodeError(id, recordErrorAtPath(job, pathKeyFor(id), error));
   }
 
-  function recordErrorAtPath(job: ScanJob, path: string, error: Error): void {
-    job.errors.push(makeErrorReport(path, error));
+  function recordErrorAtPath(job: ScanJob, path: string, error: Error): DiskUsageError {
+    const report = makeErrorReport(path, error);
+    job.errors.push(report);
+    return report;
   }
 
   function makeErrorReport(path: string, error: Error): DiskUsageError {
@@ -1328,25 +1779,33 @@ export function createDiskUsageScanner(
     );
   }
 
-  function throwIfJobInactive(job: ScanJob): void {
-    if (job.controller.signal.aborted || activeJob !== job) {
+  function isNodeActive(job: ScanJob, id: number, generation: number): boolean {
+    return !job.controller.signal.aborted && activeJob === job && isLiveRef(id, generation);
+  }
+
+  function throwIfNodeInactive(job: ScanJob, id: number, generation: number): void {
+    if (!isNodeActive(job, id, generation)) {
       throw new TraversalAbortedError();
     }
   }
 
-  function isNodeActive(job: ScanJob, node: MutableFileInfo): boolean {
-    return (
-      !job.controller.signal.aborted &&
-      activeJob === job &&
-      files.get(pathKeyForNode(node)) === node
-    );
+  function throwIfStatTaskInactive(job: ScanJob, task: Extract<ScanTask, {type: 'stat'}>): void {
+    if (task.node !== NONE) {
+      throwIfNodeInactive(job, task.node, task.nodeGeneration);
+    } else {
+      throwIfNodeInactive(job, task.parent, task.parentGeneration);
+    }
   }
 
-  function throwIfNodeInactive(job: ScanJob, node: MutableFileInfo | null): void {
-    throwIfJobInactive(job);
-    if (node && files.get(pathKeyForNode(node)) !== node) {
-      throw new TraversalAbortedError();
-    }
+  function getMemoryUsage(): DiskUsageMemoryUsage {
+    return {
+      entries: store.liveEntries,
+      entryCapacity: store.entryCapacity,
+      entryBytes: store.entryBytes,
+      nameBytes: store.nameBytes,
+      nameCapacityBytes: store.nameCapacityBytes,
+      identityBytes: identities.byteLength,
+    };
   }
 
   return {
@@ -1358,6 +1817,7 @@ export function createDiskUsageScanner(
     pause: pauseScan,
     resume: resumeScan,
     wait: waitForCurrentRun,
+    getMemoryUsage,
   };
 }
 
@@ -1370,152 +1830,31 @@ export function analyzeDiskUsage(
 }
 
 /**
- * Select directories by the space they account for beyond their largest child directory.
- * This prevents a single large subtree from occupying the list once for every ancestor,
- * while still allowing branching ancestors to rank for the other space they contain.
+ * The largest directories and files. Directories are selected by the space they account for
+ * beyond their largest child directory, so one large subtree does not fill the list once for
+ * every ancestor. While a scan runs, rankings are refreshed at most once per second.
  */
-export interface LargestCandidates {
-  directories: [string, FileInfo][];
-  files: [string, FileInfo][];
-}
-
-export function largestCandidates(
-  progress: ProgressReport,
-  count: number,
-): LargestCandidates {
-  return selectLargestCandidates(progress, count, true, true);
+export function largestCandidates(progress: ProgressReport, count: number): LargestCandidates {
+  return progress.largest(count);
 }
 
 export function largestDirectoryCandidates(
   progress: ProgressReport,
   count: number,
 ): [string, FileInfo][] {
-  return selectLargestCandidates(progress, count, true, false).directories;
+  return progress.largest(count).directories;
 }
 
 export function largestFileCandidates(
   progress: ProgressReport,
   count: number,
 ): [string, FileInfo][] {
-  return selectLargestCandidates(progress, count, false, true).files;
+  return progress.largest(count).files;
 }
 
-function selectLargestCandidates(
-  progress: ProgressReport,
-  count: number,
-  includeDirectories: boolean,
-  includeFiles: boolean,
-): LargestCandidates {
-  const limit = Math.max(0, count);
-  const directories: {path: string; info: FileInfo; selectionSize: number}[] = [];
-  const files: [string, FileInfo][] = [];
-  if (limit === 0) {
-    return {directories: [], files};
-  }
-
-  progress.files.forEach((info, path) => {
-    if (path === '.') {
-      return;
-    }
-
-    if (info.isDirectory) {
-      if (!includeDirectories) {
-        return;
-      }
-      let largestChildSize = 0;
-      for (const child of info.children) {
-        if (child.isDirectory && child.size > largestChildSize) {
-          largestChildSize = child.size;
-        }
-      }
-      const selectionSize = Math.max(0, info.size - largestChildSize);
-      if (
-        selectionSize === 0 ||
-        (directories.length === limit &&
-          compareDirectoryCandidate(
-            directories[limit - 1].path,
-            directories[limit - 1].info,
-            directories[limit - 1].selectionSize,
-            path,
-            info,
-            selectionSize,
-          ) <= 0)
-      ) {
-        return;
-      }
-
-      let index = 0;
-      while (
-        index < directories.length &&
-        compareDirectoryCandidate(
-          directories[index].path,
-          directories[index].info,
-          directories[index].selectionSize,
-          path,
-          info,
-          selectionSize,
-        ) <= 0
-      ) {
-        index += 1;
-      }
-      if (index < limit) {
-        directories.splice(index, 0, {path, info, selectionSize});
-        if (directories.length > limit) {
-          directories.pop();
-        }
-      }
-    } else if (
-      includeFiles &&
-      (files.length < limit ||
-        compareFileCandidate(files[limit - 1][0], files[limit - 1][1], path, info) > 0)
-    ) {
-      let index = 0;
-      while (
-        index < files.length &&
-        compareFileCandidate(files[index][0], files[index][1], path, info) <= 0
-      ) {
-        index += 1;
-      }
-      if (index < limit) {
-        files.splice(index, 0, [path, info]);
-        if (files.length > limit) {
-          files.pop();
-        }
-      }
-    }
-  });
-
-  return {
-    // Selection uses the non-redundant size, but the report remains ordered by total size.
-    directories: directories
-      .sort((a, b) => b.info.size - a.info.size || a.path.localeCompare(b.path))
-      .map(({path, info}) => [path, info]),
-    files,
-  };
-}
-
-function compareDirectoryCandidate(
-  aPath: string,
-  aInfo: FileInfo,
-  aSelectionSize: number,
-  bPath: string,
-  bInfo: FileInfo,
-  bSelectionSize: number,
-): number {
-  return (
-    bSelectionSize - aSelectionSize ||
-    bInfo.size - aInfo.size ||
-    aPath.localeCompare(bPath)
-  );
-}
-
-function compareFileCandidate(
-  aPath: string,
-  aInfo: FileInfo,
-  bPath: string,
-  bInfo: FileInfo,
-): number {
-  return bInfo.size - aInfo.size || aPath.localeCompare(bPath);
+function toFileError(report: DiskUsageError): Error {
+  const error = new Error(report.message);
+  return report.code ? Object.assign(error, {code: report.code}) : error;
 }
 
 function isAbortError(caught: unknown): boolean {
