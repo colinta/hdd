@@ -557,6 +557,7 @@ export function createDiskUsageScanner(
     ];
     const openDirectories = new Set<Dir>();
     const deferredOpenTasks: Extract<ScanTask, {type: 'open'}>[] = [];
+    let deferredOpenTaskIndex = 0;
     let taskIndex = 0;
 
     const enqueue = (task: ScanTask): void => {
@@ -565,18 +566,47 @@ export function createDiskUsageScanner(
       }
     };
 
+    const deferOpenTask = (task: Extract<ScanTask, {type: 'open'}>): void => {
+      deferredOpenTasks.push(task);
+    };
+
+    const enqueueNextDeferredOpenTask = (): boolean => {
+      if (
+        job.controller.signal.aborted ||
+        activeJob !== job ||
+        openDirectories.size >= MAX_OPEN_DIRECTORIES
+      ) {
+        return false;
+      }
+
+      const deferred = deferredOpenTasks[deferredOpenTaskIndex];
+      if (!deferred) {
+        return false;
+      }
+      deferredOpenTaskIndex += 1;
+      // Keep the queue FIFO without retaining an ever-growing consumed prefix.
+      if (
+        deferredOpenTaskIndex > 1024 &&
+        deferredOpenTaskIndex * 2 > deferredOpenTasks.length
+      ) {
+        deferredOpenTasks.splice(0, deferredOpenTaskIndex);
+        deferredOpenTaskIndex = 0;
+      }
+      enqueue(deferred);
+      return true;
+    };
+
     const releaseDirectory = (directory: Dir): void => {
       openDirectories.delete(directory);
-      if (openDirectories.size < MAX_OPEN_DIRECTORIES) {
-        const deferred = deferredOpenTasks.pop();
-        if (deferred) {
-          enqueue(deferred);
-        }
-      }
+      enqueueNextDeferredOpenTask();
     };
 
     const finishIfIdle = async (): Promise<void> => {
       if (job.isSettled || job.activeTasks !== 0 || taskIndex < tasks.length) {
+        return;
+      }
+      if (enqueueNextDeferredOpenTask()) {
+        pump();
         return;
       }
 
@@ -611,7 +641,7 @@ export function createDiskUsageScanner(
           task,
           enqueue,
           openDirectories,
-          deferredOpenTasks,
+          deferOpenTask,
           releaseDirectory,
         )
           .catch(caught => {
@@ -639,6 +669,7 @@ export function createDiskUsageScanner(
 
     const onAbort = (): void => {
       taskIndex = tasks.length;
+      deferredOpenTaskIndex = deferredOpenTasks.length;
       pump();
     };
     job.enqueueTask = task => {
@@ -659,7 +690,7 @@ export function createDiskUsageScanner(
     task: ScanTask,
     enqueue: (task: ScanTask) => void,
     openDirectories: Set<Dir>,
-    deferredOpenTasks: Extract<ScanTask, {type: 'open'}>[],
+    deferOpenTask: (task: Extract<ScanTask, {type: 'open'}>) => void,
     releaseDirectory: (directory: Dir) => void,
   ): Promise<void> {
     if (task.type === 'read' && !isNodeActive(job, task.node)) {
@@ -677,7 +708,7 @@ export function createDiskUsageScanner(
 
     if (task.type === 'open') {
       if (openDirectories.size >= MAX_OPEN_DIRECTORIES) {
-        deferredOpenTasks.push(task);
+        deferOpenTask(task);
         return;
       }
 

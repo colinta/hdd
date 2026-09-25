@@ -239,6 +239,24 @@ describe('scanning', () => {
     expect(fs.openHandles).toBe(0);
     expectConsistentReport(report);
   });
+
+  it('does not let newer directories jump ahead of deferred ones', async () => {
+    const files = Array.from({length: 150}, (_, index) => `  file-${index} 1kb`).join('\n');
+    const description = Array.from(
+      {length: 140},
+      (_, index) => `/dir-${index}\n${files}`,
+    ).join('\n');
+    const {fs, finish} = createTestScanner(description, {readMs: 10});
+    fs.setDelay('/', 'read', 0);
+
+    await finish();
+
+    const opened = fs
+      .operationsFor({operation: 'opendir'})
+      .map(operation => operation.path);
+    expect(fs.maxOpenHandles).toBe(128);
+    expect(opened.indexOf('/dir-128')).toBeLessThan(opened.indexOf('/dir-138'));
+  });
 });
 
 describe('refresh', () => {
