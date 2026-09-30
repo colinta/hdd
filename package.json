@@ -1,12 +1,15 @@
 {
   "name": "hdd-viz",
-  "version": "1.1.5",
+  "version": "1.1.6",
   "type": "module",
   "main": ".dist/index.js",
   "license": "",
   "bin": {
     "hdd": ".dist/index.js"
   },
+  "files": [
+    ".dist"
+  ],
   "scripts": {
     "prepublishOnly": "npm run build",
     "build": "node scripts/build.cjs",
