@@ -13,6 +13,7 @@ import {
   IDENTITY_KEEP,
   IDENTITY_MATCH,
   IDENTITY_STALE,
+  IN_USE,
   NONE,
   readDirectoryIdentity,
   type IdentityClassification,
@@ -1643,10 +1644,10 @@ export function createDiskUsageScanner(
       }
       return pathOfCurrent(id).localeCompare(candidatePath(candidate)) < 0;
     };
+    // Whether the entry belongs in a full or partial list.
+    const qualifies = (list: Candidate[], id: number, size: number, selectionSize: number) =>
+      list.length < limit || ranksBefore(id, size, selectionSize, list[limit - 1]);
     const insert = (list: Candidate[], id: number, size: number, selectionSize: number): void => {
-      if (list.length === limit && !ranksBefore(id, size, selectionSize, list[limit - 1])) {
-        return;
-      }
       let index = 0;
       while (index < list.length && !ranksBefore(id, size, selectionSize, list[index])) {
         index += 1;
@@ -1663,31 +1664,48 @@ export function createDiskUsageScanner(
       }
     };
 
-    store.forEachInSubtree(visibleRoot, id => {
-      if (id === visibleRoot) {
-        return;
-      }
+    // Scan the entry table linearly rather than walking the tree: it is far more cache friendly,
+    // and most entries are rejected by comparing sizes alone. Entries outside the visible tree
+    // (a subtree kept aside for rollback) are filtered out only when they would otherwise rank.
+    const root = visibleRoot;
+    const end = store.idLimit;
+    for (let id = 1; id < end; id++) {
       const flags = store.flags(id);
+      if (!(flags & IN_USE) || id === root) {
+        continue;
+      }
       const size = store.size(id);
       if (!(flags & DIRECTORY)) {
+        if (
+          (files.length === limit && size < files[limit - 1].selectionSize) ||
+          !qualifies(files, id, size, size) ||
+          !isAttached(id)
+        ) {
+          continue;
+        }
         insert(files, id, size, size);
-        return;
+        continue;
       }
-      if (flags & ALIAS) {
-        return;
+      // A directory's selection size never exceeds its total size.
+      if (flags & ALIAS || (directories.length === limit && size < directories[limit - 1].selectionSize)) {
+        continue;
       }
       let largestChildSize = 0;
       for (let child = store.firstChild(id); child !== NONE; child = store.nextSibling(child)) {
         const childSize = store.size(child);
-        if (isDirectoryEntry(child) && childSize > largestChildSize) {
+        if (childSize > largestChildSize && isDirectoryEntry(child)) {
           largestChildSize = childSize;
         }
       }
       const selectionSize = Math.max(0, size - largestChildSize);
-      if (selectionSize > 0) {
+      if (
+        selectionSize > 0 &&
+        qualifies(directories, id, size, selectionSize) &&
+        isAttached(id)
+      ) {
         insert(directories, id, size, selectionSize);
       }
-    });
+    }
 
     // Selection uses the non-redundant size, but the report remains ordered by total size.
     directories.sort(

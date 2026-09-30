@@ -860,6 +860,30 @@ describe('largest candidates', () => {
     expect(two.directories.map(([path]) => path)).toEqual(['a/b', 'c']);
   });
 
+  it('excludes the previous subtree kept aside during a refresh', async () => {
+    const {fs, scanner, clock, finish} = createTestScanner(RANKED, TIMED);
+    await finish();
+
+    // Hold the refreshed a/b listing: the old a (with a/b/big) is kept aside for rollback.
+    const gate = fs.hold('/a/b', 'opendir');
+    const refreshed = scanner.refresh('a');
+    await clock.advance(1_000);
+    await gate.whenReached();
+
+    const report = scanner.getReport();
+    const during = largestCandidates(report, 3);
+    expect(during.files.map(([path]) => path)).toEqual(['c/medium', 'top', 'a/small']);
+    expect(during.directories.map(([path]) => path)).toEqual(['c', 'a']);
+    expect(during.directories[1][1]).toBe(report.files.get('a'));
+
+    gate.release();
+    await clock.runAll();
+    await refreshed;
+    const after = largestCandidates(scanner.getReport(), 3);
+    expect(after.files.map(([path]) => path)).toEqual(['a/b/big', 'c/medium', 'top']);
+    expect(after.directories.map(([path]) => path)).toEqual(['a', 'a/b', 'c']);
+  });
+
   it('recomputes rankings at most once per second while scanning', async () => {
     const {fs, clock, scanner, finish} = createTestScanner(EXAMPLE, TIMED);
     fs.setDelay('/folder2/folder3', 'opendir', 5_000);

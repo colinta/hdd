@@ -189,6 +189,11 @@ export class EntryStore {
     return this.live;
   }
 
+  /** One past the highest ID ever allocated; every live ID is below it. */
+  get idLimit(): number {
+    return this.nextUnused;
+  }
+
   get entryCapacity(): number {
     return this.capacity;
   }
