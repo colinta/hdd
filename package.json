@@ -1,6 +1,6 @@
 {
   "name": "hdd-viz",
-  "version": "1.1.4",
+  "version": "1.1.5",
   "type": "module",
   "main": ".dist/index.js",
   "license": "",
@@ -18,9 +18,10 @@
     "bench": "pnpm run build && node scripts/benchmark.mjs"
   },
   "dependencies": {
-    "@teaui/core": "latest",
+    "@teaui/core": "1.20.22",
     "@teaui/react": "latest",
     "@types/node": "^24.13.2",
+    "commander": "^15.0.0",
     "react": "^18.3.1"
   },
   "devDependencies": {

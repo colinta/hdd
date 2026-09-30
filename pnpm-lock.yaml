@@ -9,7 +9,7 @@ importers:
   .:
     dependencies:
       '@teaui/core':
-        specifier: latest
+        specifier: 1.20.22
         version: 1.20.22
       '@teaui/react':
         specifier: latest
@@ -17,6 +17,9 @@ importers:
       '@types/node':
         specifier: ^24.13.2
         version: 24.13.2
+      commander:
+        specifier: ^15.0.0
+        version: 15.0.0
       react:
         specifier: ^18.3.1
         version: 18.3.1
@@ -146,21 +149,21 @@ packages:
     resolution: {integrity: sha512-2j9bGt5Jh8hj+vPtgzPtl72j0yRxHAyumoo6TNfAjsLB04UtpSvPbPcDcBMxz7n+9CYB0c1GxQFxYRg2jimqGw==}
 
   '@teaui/core@1.20.22':
-    resolution: {integrity: sha512-if6e99CeqB9MUOG5ATIfWeIWXcdpIxnmqNlF5o9X+7Fj+YH+abnEuz6nA08jKKKx8tgCspXF0oMZ11e+P3G/tA==}
+    resolution: {integrity: sha512-URMxcHRnFxzz+nmRyByHKeSB24XGF6KPmB0SSFHjndy560S+uCl2L2HeoqVtDRyZfCMxDoQ4FxNx+gX6B6rfjA==}
     engines: {node: '>= 18.12.0'}
 
   '@teaui/inspect@1.20.22':
-    resolution: {integrity: sha512-VmBEtkZiSoiZgFgK8XWV5Ke/SeOB4cDI9NLn9J6KoalRQ2C9OBKkVO6O5igzsup1XQzU6fqY0cBYriAxQfg5bQ==}
+    resolution: {integrity: sha512-DF79nzubci78BjM9TKjO3E2xmvhxsRwFEi2W0PLFwVOXbvlFBG18H/PrNtOVb44KADKGGTXXUEmbOiUnD4SODQ==}
 
   '@teaui/react@1.20.22':
-    resolution: {integrity: sha512-eIQhKTRouSH7CfDG2FUV6I6Dpq6ontk9Jqz0PLJ0jS4yMyFotphRkS+53YnvkrBd/ZJiY9qtgurpfCQlc52d8Q==}
+    resolution: {integrity: sha512-tG78/RJt0BHyLgt7XnUbJzrKZZ6mQhz+81IPv08N5LjB1XdjXU4G98KGa/4j2omrelUSiwccdH6Hf99I8q3J9Q==}
     engines: {node: '>= 18.12.0'}
     peerDependencies:
       react: ^18.2.0
       react-reconciler: ^0.29.0
 
   '@teaui/term@1.20.22':
-    resolution: {integrity: sha512-kEcrgxOeR9mtj0ot3UDj2kAzRe59iB8i/H1k8KVowBKam+kQT6kFYG/h5wv6sF+73QRyHpsYFc3MTFHbuj9lHw==}
+    resolution: {integrity: sha512-i67m6a6lwPQw7W5uRXCjLLacQOO/5aDqkMrfZaFizPA0KCurNdc55nYsDfPRb+enfPfETD/q2grTZYwTurPAoQ==}
 
   '@types/chai@5.2.3':
     resolution: {integrity: sha512-Mw558oeA9fFbv65/y4mHtXDs9bPnFMZAL/jxdPFUpOHHIXX91mcgEHbS5Lahr+pwZFR8A7GQleRWeI6cGFC2UA==}
@@ -201,6 +204,10 @@ packages:
   chai@6.2.2:
     resolution: {integrity: sha512-NUPRluOfOiTKBKvWPtSD4PhFvWCqOi0BGStNWs57X9js7XGTprSmFoz5F0tWhR4WPjNeR9jXqdC7/UpSJTnlRg==}
     engines: {node: '>=18'}
+
+  commander@15.0.0:
+    resolution: {integrity: sha512-z67u4ZhzCL/Tydu1lJARtEZYWbWaN7oYLHbsuzocr6y4N6WZAagG3RQ4FW61V1/0+jImpj293XfrcYnd1qxtPg==}
+    engines: {node: '>=22.12.0'}
 
   csstype@3.2.3:
     resolution: {integrity: sha512-z1HGKcYy2xA8AGQfwrn0PAy+PB7X/GSj3UVJW9qKyn43xWa+gl5nXmU4qqLMRzWVLFC8KusUX8T/0kCiOYpAIQ==}
@@ -586,6 +593,8 @@ snapshots:
   assertion-error@2.0.1: {}
 
   chai@6.2.2: {}
+
+  commander@15.0.0: {}
 
   csstype@3.2.3: {}
 

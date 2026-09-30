@@ -2,7 +2,9 @@
 import React from 'react';
 import {type Screen, interceptConsoleLog} from '@teaui/core';
 import {run} from '@teaui/react';
+import {readFileSync, statSync} from 'fs';
 import {resolve} from 'path';
+import {Command} from 'commander';
 import {App} from './App.js';
 import {
   createDiskUsageScanner,
@@ -24,22 +26,41 @@ const options = parseCliArgs(process.argv.slice(2));
 const targetPath = options.targetPath;
 const scanner = createDiskUsageScanner(targetPath);
 
-function parseCliArgs(args: string[]): CliOptions {
-  const paths: string[] = [];
-  let printSummary = false;
+function parseCliArgs(argv: string[]): CliOptions {
+  const packageJson = JSON.parse(
+    readFileSync(new URL('../package.json', import.meta.url), 'utf8'),
+  ) as {version: string};
 
-  for (const arg of args) {
-    if (arg === '-p' || arg === '--print') {
-      printSummary = true;
-    } else {
-      paths.push(arg);
-    }
+  const program = new Command()
+    .name('hdd')
+    .usage('[options] [folder]')
+    .description('Visualize hard disk usage for a folder (defaults to the current folder).')
+    .argument('[folder]', 'folder to scan', './')
+    .option('-p, --print', 'print a summary instead of launching the interactive UI')
+    .version(packageJson.version, '-v, --version', 'print the version and exit')
+    .helpOption('-h, --help', 'show usage');
+
+  program.parse(argv, {from: 'user'});
+  const [folder] = program.processedArgs as [string];
+  const targetPath = resolve(folder);
+
+  if (!isDirectory(targetPath)) {
+    console.error(`error: '${folder}' is not a folder`);
+    process.exit(-1);
   }
 
   return {
-    printSummary,
-    targetPath: resolve(paths[0] || './'),
+    printSummary: Boolean(program.opts().print),
+    targetPath,
   };
+}
+
+function isDirectory(path: string): boolean {
+  try {
+    return statSync(path).isDirectory();
+  } catch {
+    return false;
+  }
 }
 
 async function printDiskUsageSummary(scanner: DiskUsageScanner): Promise<void> {
