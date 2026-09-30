@@ -21,8 +21,8 @@
     "bench": "pnpm run build && node scripts/benchmark.mjs"
   },
   "dependencies": {
-    "@teaui/core": "1.20.22",
-    "@teaui/react": "latest",
+    "@teaui/core": "1.20.24",
+    "@teaui/react": "1.20.24",
     "@types/node": "^24.13.2",
     "commander": "^15.0.0",
     "react": "^18.3.1"
