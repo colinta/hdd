@@ -13,7 +13,8 @@
     "clean": "rm -rf .dist/",
     "test": "vitest run",
     "test:watch": "vitest",
-    "typecheck": "tsc -p tsconfig.test.json"
+    "typecheck": "tsc -p tsconfig.test.json",
+    "bench": "pnpm run build && node scripts/benchmark.mjs"
   },
   "dependencies": {
     "@teaui/core": "latest",
