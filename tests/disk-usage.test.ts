@@ -219,13 +219,13 @@ describe('scanning', () => {
   });
 
   it('limits concurrent filesystem operations', async () => {
-    const files = Array.from({length: 50}, (_, index) => `file-${index} 1kb`).join('\n');
+    const files = Array.from({length: 200}, (_, index) => `file-${index} 1kb`).join('\n');
     const {fs, finish} = createTestScanner(files, TIMED);
     const report = await finish();
 
-    expect(report.filesScanned).toBe(50);
-    expect(report.size).toBe(50 * 1024);
-    expect(fs.maxInFlight).toBe(8);
+    expect(report.filesScanned).toBe(200);
+    expect(report.size).toBe(200 * 1024);
+    expect(fs.maxInFlight).toBe(64);
   });
 
   it('scans trees with more directories than it keeps open', async () => {
@@ -558,17 +558,17 @@ describe('ignore', () => {
   });
 
   it('skips an entry that was listed but not yet stat-ed', async () => {
-    const files = Array.from({length: 50}, (_, index) => `file-${index} 1kb`).join('\n');
+    const files = Array.from({length: 200}, (_, index) => `file-${index} 1kb`).join('\n');
     const {fs, clock, scanner, finish} = createTestScanner(files, {fileMs: 10});
-    await clock.advanceTo(5); // 8 stats in flight, the rest queued
-    expect(fs.operationsFor({operation: 'lstat', path: '/file-40'})).toEqual([]);
+    await clock.advanceTo(5); // 64 stats in flight, the rest queued
+    expect(fs.operationsFor({operation: 'lstat', path: '/file-150'})).toEqual([]);
 
-    scanner.ignore('file-40');
+    scanner.ignore('file-150');
     const report = await finish();
 
-    expect(fs.operationsFor({operation: 'lstat', path: '/file-40'})).toEqual([]);
-    expect(report.filesScanned).toBe(49);
-    expect(report.size).toBe(49 * 1024);
+    expect(fs.operationsFor({operation: 'lstat', path: '/file-150'})).toEqual([]);
+    expect(report.filesScanned).toBe(199);
+    expect(report.size).toBe(199 * 1024);
     expect(report.isComplete).toBe(true);
     expectConsistentReport(report);
   });

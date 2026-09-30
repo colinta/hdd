@@ -190,7 +190,10 @@ class TraversalAbortedError extends Error {
   }
 }
 
-const IO_CONCURRENCY = 8;
+// Operations in flight. Well above libuv's thread pool size: many operations (buffered directory
+// reads, closes) complete without a pool thread, and a deep queue keeps every thread busy.
+// Measured on APFS, adding pool threads instead increases kernel contention and is slower.
+const IO_CONCURRENCY = 64;
 const MAX_OPEN_DIRECTORIES = 128;
 const NOTIFICATION_INTERVAL_MS = 50;
 /** While scanning, largest-entry rankings are recomputed at most this often. */
