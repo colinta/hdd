@@ -152,9 +152,9 @@ describe('readDirectoryIdentity', () => {
 });
 
 describe('DirectoryIdentityTable', () => {
-  const identity = (ino: number) => {
+  const identity = (ino: number | bigint, dev: number | bigint = 1) => {
     const out = new Uint32Array(4);
-    readDirectoryIdentity({dev: 1, ino}, out);
+    readDirectoryIdentity({dev, ino}, out);
     return out;
   };
 
@@ -196,5 +196,46 @@ describe('DirectoryIdentityTable', () => {
     expect(table.find(identity(5_001))).toBe(NONE);
     // Stale entries are dropped on rebuild, so the table tracks live directories.
     expect(table.capacity).toBeLessThan(16_384);
+  });
+
+  it('distinguishes the same inode on different devices', () => {
+    const table = new DirectoryIdentityTable(() => IDENTITY_MATCH);
+
+    table.insert(identity(42, 1), 1, 0);
+    table.insert(identity(42, 0), 2, 0);
+    table.insert(identity(42, 2n ** 60n + 7n), 3, 0);
+    table.insert(identity(2n ** 40n + 42n, 1), 4, 0);
+
+    expect(table.find(identity(42, 1))).toBe(1);
+    expect(table.find(identity(42, 0))).toBe(2);
+    expect(table.find(identity(42, 2n ** 60n + 7n))).toBe(3);
+    expect(table.find(identity(2n ** 40n + 42n, 1))).toBe(4);
+    expect(table.find(identity(42, 3))).toBe(NONE);
+    expect(table.deviceCount).toBe(3);
+  });
+
+  it('stores 15 bytes per slot and grows at three-quarters full', () => {
+    const table = new DirectoryIdentityTable(() => IDENTITY_MATCH);
+    for (let id = 1; id <= 10_000; id++) {
+      table.insert(identity(id), id, 0);
+    }
+
+    // The previous layout needed 65,536 slots of 21 bytes for 10,000 directories.
+    expect(table.capacity).toBe(16_384);
+    expect(table.byteLength).toBe(table.capacity * 15);
+    for (const id of [1, 5_000, 10_000]) {
+      expect(table.find(identity(id))).toBe(id);
+    }
+  });
+
+  it('stops indexing new devices once device indexes run out', () => {
+    const table = new DirectoryIdentityTable(() => IDENTITY_MATCH);
+    for (let device = 1; device <= 0xffff; device++) {
+      expect(table.insert(identity(1, device), device, 0)).toBe(true);
+    }
+
+    expect(table.insert(identity(1, 0x10000), 0x10000, 0)).toBe(false);
+    expect(table.find(identity(1, 0x10000))).toBe(NONE);
+    expect(table.find(identity(1, 0xffff))).toBe(0xffff);
   });
 });

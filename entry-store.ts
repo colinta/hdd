@@ -473,6 +473,12 @@ export type IdentityClassification =
 const EMPTY_SLOT = 0;
 const TOMBSTONE = 0xffffffff;
 const MIN_IDENTITY_CAPACITY = 64;
+// Grow once the table is 3/4 full (live, stale, and tombstone slots); rebuild to at most 1/2.
+const MAX_IDENTITY_LOAD = 0.75;
+const REBUILT_IDENTITY_LOAD = 0.5;
+// Device indexes are stored in 16 bits. Directories on further devices are not deduplicated.
+const MAX_IDENTITY_DEVICES = 0xffff;
+const DEVICE_KEY_HIGH_LIMIT = 2 ** 21;
 
 /**
  * Splits a device or inode number into two 32-bit words. Returns false when the value is
@@ -514,12 +520,21 @@ export function readDirectoryIdentity(
  * An open-addressed table from directory identity `(dev, ino)` to the entry that owns it.
  * Several entries may share an identity (for example, a subtree kept aside for rollback and
  * its replacement); `classify` decides which are current. Stale entries are dropped lazily.
+ *
+ * Device numbers are replaced by small indexes because a scan sees only a few devices. Each
+ * slot stores the inode (8 bytes), device index (2), entry ID (4), and generation (1).
  */
 export class DirectoryIdentityTable {
-  private keys = new Uint32Array(0);
+  private inodeHigh = new Uint32Array(0);
+  private inodeLow = new Uint32Array(0);
+  private devices = new Uint16Array(0);
   private ids = new Uint32Array(0);
   private generations = new Uint8Array(0);
   private occupied = 0;
+  private readonly deviceIndexes = new Map<number | string, number>();
+  private lastDeviceHigh = -1;
+  private lastDeviceLow = -1;
+  private lastDeviceIndex = 0;
 
   constructor(
     private readonly classify: (id: number, generation: number) => IdentityClassification,
@@ -529,23 +544,41 @@ export class DirectoryIdentityTable {
     return this.ids.length;
   }
 
+  get deviceCount(): number {
+    return this.deviceIndexes.size;
+  }
+
   get byteLength(): number {
-    return this.keys.byteLength + this.ids.byteLength + this.generations.byteLength;
+    return (
+      this.inodeHigh.byteLength +
+      this.inodeLow.byteLength +
+      this.devices.byteLength +
+      this.ids.byteLength +
+      this.generations.byteLength
+    );
   }
 
   /** Returns the current owner of an identity, or NONE. */
   find(identity: Uint32Array): number {
     const capacity = this.ids.length;
-    if (!capacity) {
+    const device = this.deviceIndex(identity, false);
+    if (!capacity || device === 0) {
       return NONE;
     }
+    const inodeHigh = identity[2];
+    const inodeLow = identity[3];
     const mask = capacity - 1;
-    for (let slot = hashIdentity(identity) & mask; ; slot = (slot + 1) & mask) {
+    for (let slot = hashIdentity(device, inodeHigh, inodeLow) & mask; ; slot = (slot + 1) & mask) {
       const id = this.ids[slot];
       if (id === EMPTY_SLOT) {
         return NONE;
       }
-      if (id === TOMBSTONE || !this.matches(slot, identity)) {
+      if (
+        id === TOMBSTONE ||
+        this.devices[slot] !== device ||
+        this.inodeHigh[slot] !== inodeHigh ||
+        this.inodeLow[slot] !== inodeLow
+      ) {
         continue;
       }
       const classification = this.classify(id, this.generations[slot]);
@@ -558,74 +591,104 @@ export class DirectoryIdentityTable {
     }
   }
 
-  insert(identity: Uint32Array, id: number, generation: number): void {
-    if ((this.occupied + 1) * 2 > this.ids.length) {
+  /** Records an owner. Returns false when the identity's device cannot be indexed. */
+  insert(identity: Uint32Array, id: number, generation: number): boolean {
+    const device = this.deviceIndex(identity, true);
+    if (device === 0) {
+      return false;
+    }
+    if (this.occupied + 1 > this.ids.length * MAX_IDENTITY_LOAD) {
       this.rebuild();
     }
-    this.place(identity, 0, id, generation);
+    this.place(device, identity[2], identity[3], id, generation);
+    return true;
   }
 
-  private place(key: Uint32Array, keyOffset: number, id: number, generation: number): void {
+  /** A 1-based index for the identity's device, or 0 when unknown (or out of indexes). */
+  private deviceIndex(identity: Uint32Array, create: boolean): number {
+    const high = identity[0];
+    const low = identity[1];
+    if (high === this.lastDeviceHigh && low === this.lastDeviceLow) {
+      return this.lastDeviceIndex;
+    }
+
+    // Combine the words into an exact number when possible; otherwise use a string key.
+    const key = high < DEVICE_KEY_HIGH_LIMIT ? high * 2 ** 32 + low : `${high}:${low}`;
+    let index = this.deviceIndexes.get(key) ?? 0;
+    if (index === 0 && create && this.deviceIndexes.size < MAX_IDENTITY_DEVICES) {
+      index = this.deviceIndexes.size + 1;
+      this.deviceIndexes.set(key, index);
+    }
+    if (index !== 0) {
+      this.lastDeviceHigh = high;
+      this.lastDeviceLow = low;
+      this.lastDeviceIndex = index;
+    }
+    return index;
+  }
+
+  private place(
+    device: number,
+    inodeHigh: number,
+    inodeLow: number,
+    id: number,
+    generation: number,
+  ): void {
     const mask = this.ids.length - 1;
-    let slot = hashIdentity(key, keyOffset) & mask;
+    let slot = hashIdentity(device, inodeHigh, inodeLow) & mask;
     while (this.ids[slot] !== EMPTY_SLOT && this.ids[slot] !== TOMBSTONE) {
       slot = (slot + 1) & mask;
     }
     if (this.ids[slot] === EMPTY_SLOT) {
       this.occupied += 1;
     }
-    const base = slot * 4;
-    this.keys[base] = key[keyOffset];
-    this.keys[base + 1] = key[keyOffset + 1];
-    this.keys[base + 2] = key[keyOffset + 2];
-    this.keys[base + 3] = key[keyOffset + 3];
+    this.devices[slot] = device;
+    this.inodeHigh[slot] = inodeHigh;
+    this.inodeLow[slot] = inodeLow;
     this.ids[slot] = id;
     this.generations[slot] = generation;
   }
 
-  private matches(slot: number, identity: Uint32Array): boolean {
-    const base = slot * 4;
-    return (
-      this.keys[base] === identity[0] &&
-      this.keys[base + 1] === identity[1] &&
-      this.keys[base + 2] === identity[2] &&
-      this.keys[base + 3] === identity[3]
-    );
-  }
-
   private rebuild(): void {
-    const {keys, ids, generations} = this;
-    const retained: number[] = [];
+    const {inodeHigh, inodeLow, devices, ids, generations} = this;
+    // Mark stale owners in place instead of collecting live slots in a temporary array.
+    let retained = 0;
     for (let slot = 0; slot < ids.length; slot++) {
       const id = ids[slot];
-      if (
-        id !== EMPTY_SLOT &&
-        id !== TOMBSTONE &&
-        this.classify(id, generations[slot]) !== IDENTITY_STALE
-      ) {
-        retained.push(slot);
+      if (id === EMPTY_SLOT || id === TOMBSTONE) {
+        continue;
+      }
+      if (this.classify(id, generations[slot]) === IDENTITY_STALE) {
+        ids[slot] = TOMBSTONE;
+      } else {
+        retained += 1;
       }
     }
 
     let capacity = MIN_IDENTITY_CAPACITY;
-    while (capacity < (retained.length + 1) * 4) {
+    while ((retained + 1) > capacity * REBUILT_IDENTITY_LOAD) {
       capacity *= 2;
     }
-    this.keys = new Uint32Array(capacity * 4);
+    this.inodeHigh = new Uint32Array(capacity);
+    this.inodeLow = new Uint32Array(capacity);
+    this.devices = new Uint16Array(capacity);
     this.ids = new Uint32Array(capacity);
     this.generations = new Uint8Array(capacity);
     this.occupied = 0;
-    for (const slot of retained) {
-      this.place(keys, slot * 4, ids[slot], generations[slot]);
+    for (let slot = 0; slot < ids.length; slot++) {
+      const id = ids[slot];
+      if (id !== EMPTY_SLOT && id !== TOMBSTONE) {
+        this.place(devices[slot], inodeHigh[slot], inodeLow[slot], id, generations[slot]);
+      }
     }
   }
 }
 
-function hashIdentity(key: Uint32Array, offset = 0): number {
-  let hash = 0x811c9dc5;
-  for (let index = offset; index < offset + 4; index++) {
-    hash = Math.imul(hash ^ key[index], 0x01000193);
-    hash ^= hash >>> 15;
-  }
+function hashIdentity(device: number, inodeHigh: number, inodeLow: number): number {
+  let hash = Math.imul(device ^ 0x811c9dc5, 0x01000193);
+  hash ^= hash >>> 15;
+  hash = Math.imul(hash ^ inodeHigh, 0x01000193);
+  hash ^= hash >>> 15;
+  hash = Math.imul(hash ^ inodeLow, 0x01000193);
   return Math.imul(hash ^ (hash >>> 13), 0x5bd1e995) >>> 0;
 }
