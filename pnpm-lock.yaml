@@ -9,11 +9,11 @@ importers:
   .:
     dependencies:
       '@teaui/core':
-        specifier: 1.20.22
-        version: 1.20.22
+        specifier: 1.20.24
+        version: 1.20.24
       '@teaui/react':
-        specifier: latest
-        version: 1.20.22(react-reconciler@0.29.2(react@18.3.1))(react@18.3.1)
+        specifier: 1.20.24
+        version: 1.20.24(react-reconciler@0.29.2(react@18.3.1))(react@18.3.1)
       '@types/node':
         specifier: ^24.13.2
         version: 24.13.2
@@ -148,22 +148,22 @@ packages:
   '@rolldown/pluginutils@1.0.1':
     resolution: {integrity: sha512-2j9bGt5Jh8hj+vPtgzPtl72j0yRxHAyumoo6TNfAjsLB04UtpSvPbPcDcBMxz7n+9CYB0c1GxQFxYRg2jimqGw==}
 
-  '@teaui/core@1.20.22':
-    resolution: {integrity: sha512-URMxcHRnFxzz+nmRyByHKeSB24XGF6KPmB0SSFHjndy560S+uCl2L2HeoqVtDRyZfCMxDoQ4FxNx+gX6B6rfjA==}
+  '@teaui/core@1.20.24':
+    resolution: {integrity: sha512-JOR6brz7t+GBAhITd0DJ/NSpTqWJwQEX/eUcd++yh+yvNGadgcVIYjezLIKvRWo1ypnOUy/+KjKz9mEMzRY6DA==}
     engines: {node: '>= 18.12.0'}
 
-  '@teaui/inspect@1.20.22':
-    resolution: {integrity: sha512-DF79nzubci78BjM9TKjO3E2xmvhxsRwFEi2W0PLFwVOXbvlFBG18H/PrNtOVb44KADKGGTXXUEmbOiUnD4SODQ==}
+  '@teaui/inspect@1.20.24':
+    resolution: {integrity: sha512-CGKrzRi9aXi9HxVysXRmApIrERiSDm1sP+XdxzX17H6S4PKn7b9Jw0qkJMnPao5RmRKPAlNFQKwJ5V7aWOOodQ==}
 
-  '@teaui/react@1.20.22':
-    resolution: {integrity: sha512-tG78/RJt0BHyLgt7XnUbJzrKZZ6mQhz+81IPv08N5LjB1XdjXU4G98KGa/4j2omrelUSiwccdH6Hf99I8q3J9Q==}
+  '@teaui/react@1.20.24':
+    resolution: {integrity: sha512-CG03/D9Y/YkEuGauwJBSYYR1Xg7/6SjzczYf1aYC+t27c8EvbvcSoNCmBt8NO+D5z9kqPh9tdCT5iu72dnRmaw==}
     engines: {node: '>= 18.12.0'}
     peerDependencies:
       react: ^18.2.0
       react-reconciler: ^0.29.0
 
-  '@teaui/term@1.20.22':
-    resolution: {integrity: sha512-i67m6a6lwPQw7W5uRXCjLLacQOO/5aDqkMrfZaFizPA0KCurNdc55nYsDfPRb+enfPfETD/q2grTZYwTurPAoQ==}
+  '@teaui/term@1.20.24':
+    resolution: {integrity: sha512-Vsfai/NlVjIyaIt9PkHFbe/eDQ8yC16VsJ23+Lb2Hx/mDXCuVeR57XmLXShCTV4XfQ4v4mowyWlprsfKUJyBoA==}
 
   '@types/chai@5.2.3':
     resolution: {integrity: sha512-Mw558oeA9fFbv65/y4mHtXDs9bPnFMZAL/jxdPFUpOHHIXX91mcgEHbS5Lahr+pwZFR8A7GQleRWeI6cGFC2UA==}
@@ -544,20 +544,20 @@ snapshots:
 
   '@rolldown/pluginutils@1.0.1': {}
 
-  '@teaui/core@1.20.22':
+  '@teaui/core@1.20.24':
     dependencies:
-      '@teaui/inspect': 1.20.22
-      '@teaui/term': 1.20.22
+      '@teaui/inspect': 1.20.24
+      '@teaui/term': 1.20.24
 
-  '@teaui/inspect@1.20.22': {}
+  '@teaui/inspect@1.20.24': {}
 
-  '@teaui/react@1.20.22(react-reconciler@0.29.2(react@18.3.1))(react@18.3.1)':
+  '@teaui/react@1.20.24(react-reconciler@0.29.2(react@18.3.1))(react@18.3.1)':
     dependencies:
-      '@teaui/core': 1.20.22
+      '@teaui/core': 1.20.24
       react: 18.3.1
       react-reconciler: 0.29.2(react@18.3.1)
 
-  '@teaui/term@1.20.22': {}
+  '@teaui/term@1.20.24': {}
 
   '@types/chai@5.2.3':
     dependencies:
