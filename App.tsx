@@ -1,6 +1,16 @@
 import {existsSync} from 'node:fs';
 import React, {useEffect, useState} from 'react';
-import {Button, Scrollable, Separator, Space, Spinner, Stack, Style, Text} from '@teaui/react';
+import {
+  Button,
+  Progress,
+  Scrollable,
+  Separator,
+  Space,
+  Spinner,
+  Stack,
+  Style,
+  Text,
+} from '@teaui/react';
 import {
   formatBytes,
   formatElapsed,
@@ -106,8 +116,9 @@ export function App({scanner, targetPath, onExit}: AppProps) {
         <StatusText progress={progress} />
         <Text italic>Total disk usage: {formatBytes(progress.size)}</Text>
         <Text italic>
-          Scanned: {progress.entriesScanned} entries ({progress.filesScanned} files,{' '}
-          {progress.directoriesScanned} directories)
+          Scanned: {progress.entriesScanned.toLocaleString('en-US')} entries (
+          {progress.filesScanned.toLocaleString('en-US')} files,{' '}
+          {progress.directoriesScanned.toLocaleString('en-US')} directories)
         </Text>
         <Text italic>Elapsed: {formatElapsed(progress.elapsedMs)}</Text>
         {progress.errors.length ? (
@@ -145,7 +156,7 @@ export function App({scanner, targetPath, onExit}: AppProps) {
           {progress.path} {formatBytes(progress.size)}
         </Text>
         <Scrollable>
-          <Files files={progress.children} onRefresh={refreshReport} />
+          <Files files={progress.children} onRefresh={refreshReport} total={progress.size} />
         </Scrollable>
       </Stack.down>
     </Stack.down>
@@ -221,7 +232,7 @@ function Entries({
   );
 }
 
-function Files({files, onRefresh}: {files: FileInfo[]; onRefresh(): void}) {
+function Files({files, onRefresh, total}: {files: FileInfo[]; onRefresh(): void; total: number}) {
   // Expansion belongs to the whole browser, rather than to each recursively rendered level.
   // Rows are keyed by position for TeaUI, so a size change can move a directory to another row;
   // keeping the paths here prevents that move from remounting and collapsing its descendants.
@@ -230,6 +241,7 @@ function Files({files, onRefresh}: {files: FileInfo[]; onRefresh(): void}) {
   return (
     <FileRows
       files={files}
+      total={total}
       expandedPaths={expandedPaths}
       onToggle={path =>
         setExpandedPaths(previous => {
@@ -253,11 +265,13 @@ const MAX_ROWS_PER_DIRECTORY = 500;
 
 function FileRows({
   files,
+  total,
   expandedPaths,
   onToggle,
   onRefresh,
 }: {
   files: FileInfo[];
+  total: number;
   expandedPaths: Set<string>;
   onToggle(path: string): void;
   onRefresh(): void;
@@ -288,6 +302,7 @@ function FileRows({
           // Key by display position so each row receives the entry from the newly sorted array.
           <Stack.down key={index}>
             <Stack.right>
+            <Stack.right flex={2}>
               {fileInfo.isDirectory ? (
                 <Button
                   border="none"
@@ -322,20 +337,25 @@ function FileRows({
                 />
               ) : null}
               <Text italic> {formatBytes(fileInfo.size)}</Text>
-              {fileInfo.isDirectory && !fileInfo.aliasOf ? (
-                <Text> ({fileInfo.childCount})</Text>
-              ) : null}
-              {fileInfo.aliasOf ? (
-                <Text dim> (already counted at {fileInfo.aliasOf})</Text>
-              ) : null}
               {!fileInfo.isComplete ? <Text> scanning…</Text> : null}
               {fileInfo.error ? <Text> ⚠ {fileInfo.error.message}</Text> : null}
+              <Space width={1} />
             </Stack.right>
+            <Stack.right flex={1}>
+              <Progress
+                flex={1}
+                max={total}
+                value={fileInfo.size}
+                showPercent
+              />
+            </Stack.right>
+          </Stack.right>
             {isDirExpanded ? (
               <Stack.right>
                 <Space width={2} />
                 <FileRows
                   files={fileInfo.children}
+                  total={total}
                   expandedPaths={expandedPaths}
                   onToggle={onToggle}
                   onRefresh={onRefresh}

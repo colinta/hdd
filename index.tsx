@@ -50,7 +50,7 @@ async function printDiskUsageSummary(scanner: DiskUsageScanner): Promise<void> {
     `Hard disk usage report: ${progress.rootPath}`,
     `Status: ${status}`,
     `Total disk usage: ${formatBytes(progress.size)}`,
-    `Scanned: ${progress.entriesScanned} entries (${progress.filesScanned} files, ${progress.directoriesScanned} directories)`,
+    `Scanned: ${progress.entriesScanned.toLocaleString('en-US')} entries (${progress.filesScanned.toLocaleString('en-US')} files, ${progress.directoriesScanned.toLocaleString('en-US')} directories)`,
     `Elapsed: ${formatElapsed(progress.elapsedMs)}`,
     `Warnings: ${progress.errors.length}`,
     '',
