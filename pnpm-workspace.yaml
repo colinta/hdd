@@ -1,2 +1,6 @@
+allowBuilds:
+  node-pty: true
 minimumReleaseAgeExclude:
   - '@teaui/*'
+patchedDependencies:
+  '@teaui/subprocess@1.22.24': patches/@teaui__subprocess@1.22.24.patch

@@ -2,6 +2,7 @@ import {existsSync} from 'node:fs';
 import React, {useEffect, useState} from 'react';
 import {
   Button,
+  HotKey,
   Progress,
   Scrollable,
   Separator,
@@ -20,6 +21,7 @@ import {
   type ProgressReport,
 } from './disk-usage.js';
 import {containingFolderLink, fileLink} from './terminal-link.js';
+import {Terminal} from './terminal-modal.js';
 
 interface BuildInfo {
   version: string;
@@ -41,6 +43,7 @@ export interface AppProps {
 export function App({scanner, targetPath, onExit}: AppProps) {
   const [topCount, setTopCount] = useState(10);
   const [progress, setProgress] = useState<ProgressReport>(() => scanner.getReport());
+  const [terminalDir, setTerminalDir] = useState<FileInfo | null>(null);
 
   function refreshReport() {
     setProgress(scanner.getReport());
@@ -62,6 +65,22 @@ export function App({scanner, targetPath, onExit}: AppProps) {
 
   return (
     <Stack.down>
+      {/* The screen's built-in Ctrl-C handler is disabled (see index.tsx) so that
+          Ctrl-C reaches the shell while the terminal is open. Hotkeys from the main
+          tree aren't active while a modal is presented. */}
+      <HotKey hotKey="C-c" onPress={onExit} />
+      {terminalDir ? (
+        <Terminal
+          key={terminalDir.absolutePath}
+          cwd={terminalDir.absolutePath}
+          onClose={() => {
+            setTerminalDir(null);
+            // The shell may have changed this directory's contents.
+            void terminalDir.refresh();
+            refreshReport();
+          }}
+        />
+      ) : null}
       <Stack.down flex={1}>
         <Stack.right>
           <Text flex={1} bold>
@@ -156,7 +175,12 @@ export function App({scanner, targetPath, onExit}: AppProps) {
           {progress.path} {formatBytes(progress.size)}
         </Text>
         <Scrollable>
-          <Files files={progress.children} onRefresh={refreshReport} total={progress.size} />
+          <Files
+            files={progress.children}
+            onRefresh={refreshReport}
+            onTerminal={setTerminalDir}
+            total={progress.size}
+          />
         </Scrollable>
       </Stack.down>
     </Stack.down>
@@ -232,7 +256,17 @@ function Entries({
   );
 }
 
-function Files({files, onRefresh, total}: {files: FileInfo[]; onRefresh(): void; total: number}) {
+function Files({
+  files,
+  onRefresh,
+  onTerminal,
+  total,
+}: {
+  files: FileInfo[];
+  onRefresh(): void;
+  onTerminal(fileInfo: FileInfo): void;
+  total: number;
+}) {
   // Expansion belongs to the whole browser, rather than to each recursively rendered level.
   // Rows are keyed by position for TeaUI, so a size change can move a directory to another row;
   // keeping the paths here prevents that move from remounting and collapsing its descendants.
@@ -255,6 +289,7 @@ function Files({files, onRefresh, total}: {files: FileInfo[]; onRefresh(): void;
         })
       }
       onRefresh={onRefresh}
+      onTerminal={onTerminal}
     />
   );
 }
@@ -269,12 +304,14 @@ function FileRows({
   expandedPaths,
   onToggle,
   onRefresh,
+  onTerminal,
 }: {
   files: FileInfo[];
   total: number;
   expandedPaths: Set<string>;
   onToggle(path: string): void;
   onRefresh(): void;
+  onTerminal(fileInfo: FileInfo): void;
 }) {
   // Siblings share a parent path, so comparing names orders them like comparing paths.
   const sorted: FileInfo[] = [...files].sort(
@@ -327,6 +364,9 @@ function FileRows({
                 />
               ) : null}
               {fileInfo.isDirectory ? (
+                <Button border="none" title="❯" onClick={() => onTerminal(fileInfo)} />
+              ) : null}
+              {fileInfo.isDirectory ? (
                 <Button
                   border="none"
                   title="Ⓘ"
@@ -359,6 +399,7 @@ function FileRows({
                   expandedPaths={expandedPaths}
                   onToggle={onToggle}
                   onRefresh={onRefresh}
+                  onTerminal={onTerminal}
                 />
               </Stack.right>
             ) : null}

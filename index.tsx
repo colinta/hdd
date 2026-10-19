@@ -144,6 +144,9 @@ if (options.printSummary) {
           screen?.exit();
         },
       }),
+      // App registers its own Ctrl-C hotkey, so that Ctrl-C reaches the embedded
+      // shell while the terminal modal is open.
+      {quitChar: false},
     );
     screen = screen_;
   })();

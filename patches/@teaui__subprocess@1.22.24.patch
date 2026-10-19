@@ -1,0 +1,105 @@
+diff --git a/.dist/Subprocess.js b/.dist/Subprocess.js
+index 1ca7797eb22058eb3809847a11de9a5b51caa6cf..0eba6f135a8abcf5ced4411d5ab36a5a0339c867 100644
+--- a/.dist/Subprocess.js
++++ b/.dist/Subprocess.js
+@@ -18,6 +18,11 @@ export class Subprocess extends View {
+     #lastCols = 0;
+     #lastRows = 0;
+     #styleCache = new StyleCache();
++    // DECTCEM (CSI ?25 h/l) — xterm-headless doesn't expose cursor visibility.
++    #cursorVisible = true;
++    // Last forwarded mouse-move position, to drop the synthetic `mouse.move.in`
++    // that MouseManager sends after renders.
++    #lastMove = null;
+     constructor(props) {
+         super({
+             width: props.width ?? 'fill',
+@@ -69,6 +74,15 @@ export class Subprocess extends View {
+         this.#xterm = xterm;
+         // Pre-allocate a reusable cell reference for render performance
+         this.#cellRef = xterm.buffer.active.getNullCell();
++        const trackCursor = (visible) => (params) => {
++            if (params.includes(25)) {
++                this.#cursorVisible = visible;
++            }
++            // let xterm handle the sequence as well
++            return false;
++        };
++        xterm.parser.registerCsiHandler({ prefix: '?', final: 'h' }, trackCursor(true));
++        xterm.parser.registerCsiHandler({ prefix: '?', final: 'l' }, trackCursor(false));
+         try {
+             this.#pty = ptyMod.spawn(this.#command, this.#args, {
+                 name: 'xterm-256color',
+@@ -171,6 +185,49 @@ export class Subprocess extends View {
+             return;
+         }
+         this.#renderXtermBuffer(viewport, cols, rows);
++        if (hasFocus) {
++            this.#renderCursor(viewport, cols, rows);
++        }
++    }
++    #renderCursor(viewport, cols, rows) {
++        const buffer = this.#xterm.buffer.active;
++        // cursorY is relative to baseY; hide the cursor if it's scrolled out of view
++        const y = buffer.cursorY + buffer.baseY - buffer.viewportY;
++        if (!this.#cursorVisible || y < 0 || y >= rows) {
++            return;
++        }
++        const x = Math.min(buffer.cursorX, cols - 1);
++        const cell = buffer.getLine(buffer.viewportY + y)?.getCell(x, this.#cellRef ?? undefined);
++        const chars = cell?.getChars() || ' ';
++        const style = cell ? this.#styleCache.styleForCell(cell) : Style.NONE;
++        viewport.write(chars, new Point(x, y), style.merge(new Style({ inverse: !cell?.isInverse() })));
++    }
++    #shouldForwardMouse(event) {
++        // Only send mouse reports if the child asked for them (DECSET 1000/1002/1003);
++        // otherwise e.g. a shell just echoes the escape sequences.
++        const mode = this.#xterm?.modes.mouseTrackingMode ?? 'none';
++        const name = event.name;
++        if (mode === 'none') {
++            return false;
++        }
++        if (mode === 'x10') {
++            return name === 'mouse.button.down';
++        }
++        if (name.startsWith('mouse.move.')) {
++            if (mode !== 'any' || name !== 'mouse.move.in') {
++                return false;
++            }
++            const { x, y } = event.position;
++            if (this.#lastMove?.x === x && this.#lastMove?.y === y) {
++                return false;
++            }
++            this.#lastMove = { x, y };
++            return true;
++        }
++        if (name.startsWith('mouse.button.drag')) {
++            return mode === 'drag' || mode === 'any';
++        }
++        return true;
+     }
+     #renderMessage(viewport, cols, rows, message) {
+         viewport.paint(Style.NONE);
+@@ -183,8 +240,11 @@ export class Subprocess extends View {
+         // Re-acquire cell ref after potential buffer switch (normal/alt)
+         const cellRef = this.#cellRef ?? buffer.getNullCell();
+         const styleCache = this.#styleCache;
++        // getLine() indexes the whole buffer (scrollback included); the visible
++        // screen starts at viewportY.
++        const top = buffer.viewportY;
+         for (let y = 0; y < rows; y++) {
+-            const line = buffer.getLine(y);
++            const line = buffer.getLine(top + y);
+             if (!line) {
+                 for (let x = 0; x < cols; x++) {
+                     viewport.write(' ', new Point(x, y));
+@@ -242,6 +302,9 @@ export class Subprocess extends View {
+         if (!this.#pty || this.#state.kind !== 'running') {
+             return;
+         }
++        if (!this.#shouldForwardMouse(event)) {
++            return;
++        }
+         const bytes = mouseEventToAnsi(event);
+         if (bytes) {
+             this.#pty.write(bytes);
