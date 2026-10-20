@@ -12,14 +12,8 @@ import {
   Style,
   Text,
 } from '@teaui/react';
-import {
-  formatBytes,
-  formatElapsed,
-  largestCandidates,
-  type DiskUsageScanner,
-  type FileInfo,
-  type ProgressReport,
-} from './disk-usage.js';
+import {formatBytes, formatElapsed, type FileInfo} from './disk-usage.js';
+import {type CombinedReport, type MultiScanner, type RootEntry} from './multi-scanner.js';
 import {containingFolderLink, fileLink} from './terminal-link.js';
 import {Terminal} from './terminal-modal.js';
 
@@ -35,14 +29,14 @@ const buildInfo: BuildInfo | undefined = existsSync(buildInfoUrl)
   : undefined;
 
 export interface AppProps {
-  scanner: DiskUsageScanner;
-  targetPath: string;
+  scanner: MultiScanner;
+  targetPaths: string[];
   onExit(): void;
 }
 
-export function App({scanner, targetPath, onExit}: AppProps) {
+export function App({scanner, targetPaths, onExit}: AppProps) {
   const [topCount, setTopCount] = useState(10);
-  const [progress, setProgress] = useState<ProgressReport>(() => scanner.getReport());
+  const [progress, setProgress] = useState<CombinedReport>(() => scanner.getReport());
   const [terminalDir, setTerminalDir] = useState<FileInfo | null>(null);
 
   function refreshReport() {
@@ -58,10 +52,7 @@ export function App({scanner, targetPath, onExit}: AppProps) {
     return unsubscribe;
   }, [scanner]);
 
-  const {directories: largestDirectories, files: largestFiles} = largestCandidates(
-    progress,
-    topCount,
-  );
+  const {directories: largestDirectories, files: largestFiles} = progress.largest(topCount);
 
   return (
     <Stack.down>
@@ -84,7 +75,8 @@ export function App({scanner, targetPath, onExit}: AppProps) {
       <Stack.down flex={1}>
         <Stack.right>
           <Text flex={1} bold>
-            Hard disk usage report: {targetPath}
+            Hard disk usage report:{' '}
+            {targetPaths.length > 1 ? `${targetPaths.length} folders` : targetPaths[0]}
           </Text>
           {buildInfo ? (
             <>
@@ -171,9 +163,12 @@ export function App({scanner, targetPath, onExit}: AppProps) {
 
         <Separator direction="horizontal" border="single" />
 
-        <Text bold>
-          {progress.path} {formatBytes(progress.size)}
-        </Text>
+        {progress.roots.map((root, index) => (
+          <Text bold key={index}>
+            {progress.isMultiple ? `${index + 1}. ` : ''}
+            {root.path} {formatBytes(root.size)}
+          </Text>
+        ))}
         <Scrollable>
           <Files
             files={progress.children}
@@ -187,7 +182,7 @@ export function App({scanner, targetPath, onExit}: AppProps) {
   );
 }
 
-export function StatusText({progress}: {progress: ProgressReport}) {
+export function StatusText({progress}: {progress: CombinedReport}) {
   if (progress.isAborted) {
     return <Text italic>Status: Aborted</Text>;
   }
@@ -234,11 +229,11 @@ function Entries({
         ))}
       </Stack.down>
       <Stack.down flex={1}>
-        {entries.map(([, info], index) => (
+        {entries.map(([path, info], index) => (
           <Text key={index}>
             {info.isDirectory
-              ? fileLink(info.absolutePath, displayPath(info))
-              : containingFolderLink(info.absolutePath, displayPath(info))}
+              ? fileLink(info.absolutePath, path || info.name)
+              : containingFolderLink(info.absolutePath, path || info.name)}
           </Text>
         ))}
       </Stack.down>
@@ -262,7 +257,7 @@ function Files({
   onTerminal,
   total,
 }: {
-  files: FileInfo[];
+  files: RootEntry[];
   onRefresh(): void;
   onTerminal(fileInfo: FileInfo): void;
   total: number;
@@ -270,6 +265,7 @@ function Files({
   // Expansion belongs to the whole browser, rather than to each recursively rendered level.
   // Rows are keyed by position for TeaUI, so a size change can move a directory to another row;
   // keeping the paths here prevents that move from remounting and collapsing its descendants.
+  // Absolute paths are used, because relative paths are ambiguous across scanned folders.
   const [expandedPaths, setExpandedPaths] = useState<Set<string>>(new Set());
 
   return (
@@ -306,16 +302,19 @@ function FileRows({
   onRefresh,
   onTerminal,
 }: {
-  files: FileInfo[];
+  files: RootEntry[];
   total: number;
   expandedPaths: Set<string>;
   onToggle(path: string): void;
   onRefresh(): void;
   onTerminal(fileInfo: FileInfo): void;
 }) {
-  // Siblings share a parent path, so comparing names orders them like comparing paths.
-  const sorted: FileInfo[] = [...files].sort(
-    (a, b) => b.size - a.size || a.name.localeCompare(b.name),
+  // Siblings share a parent path (or are prefixed with their root), so comparing prefixed
+  // names orders them like comparing paths.
+  const sorted: RootEntry[] = [...files].sort(
+    (a, b) =>
+      b.info.size - a.info.size ||
+      (a.prefix + a.info.name).localeCompare(b.prefix + b.info.name),
   );
 
   if (!sorted.length) {
@@ -326,13 +325,13 @@ function FileRows({
   const hiddenCount = sorted.length - visible.length;
   const hiddenSize = sorted
     .slice(MAX_ROWS_PER_DIRECTORY)
-    .reduce((total, fileInfo) => total + fileInfo.size, 0);
+    .reduce((total, {info}) => total + info.size, 0);
 
   return (
     <Stack.down>
-      {visible.map((fileInfo, index) => {
-        const summary = fileInfo.name + (fileInfo.isDirectory ? '/' : '');
-        const isDirExpanded = fileInfo.isDirectory && expandedPaths.has(fileInfo.path);
+      {visible.map(({prefix, info: fileInfo}, index) => {
+        const summary = prefix + fileInfo.name + (fileInfo.isDirectory ? '/' : '');
+        const isDirExpanded = fileInfo.isDirectory && expandedPaths.has(fileInfo.absolutePath);
 
         return (
           // TeaUI's renderer updates rows in place but does not reliably move keyed host nodes.
@@ -348,7 +347,7 @@ function FileRows({
                     ' ' +
                     fileLink(fileInfo.absolutePath, summary)
                   }
-                  onClick={() => onToggle(fileInfo.path)}
+                  onClick={() => onToggle(fileInfo.absolutePath)}
                 />
               ) : (
                 <Text>{'   ' + fileLink(fileInfo.absolutePath, summary) + ' '}</Text>
@@ -394,7 +393,7 @@ function FileRows({
               <Stack.right>
                 <Space width={2} />
                 <FileRows
-                  files={fileInfo.children}
+                  files={fileInfo.children.map(info => ({prefix: '', info}))}
                   total={total}
                   expandedPaths={expandedPaths}
                   onToggle={onToggle}
@@ -414,8 +413,4 @@ function FileRows({
       ) : null}
     </Stack.down>
   );
-}
-
-function displayPath(info: FileInfo): string {
-  return info.path || info.name;
 }

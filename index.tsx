@@ -6,25 +6,18 @@ import {readFileSync, statSync} from 'fs';
 import {resolve} from 'path';
 import {Command} from 'commander';
 import {App} from './App.js';
-import {
-  createDiskUsageScanner,
-  formatBytes,
-  formatElapsed,
-  largestCandidates,
-  type DiskUsageScanner,
-  type FileInfo,
-  type ProgressReport,
-} from './disk-usage.js';
+import {formatBytes, formatElapsed, type FileInfo} from './disk-usage.js';
+import {createMultiScanner, type MultiScanner} from './multi-scanner.js';
 import {containingFolderLink, fileLink} from './terminal-link.js';
 
 interface CliOptions {
   printSummary: boolean;
-  targetPath: string;
+  targetPaths: string[];
 }
 
 const options = parseCliArgs(process.argv.slice(2));
-const targetPath = options.targetPath;
-const scanner = createDiskUsageScanner(targetPath);
+const targetPaths = options.targetPaths;
+const scanner = createMultiScanner(targetPaths);
 
 function parseCliArgs(argv: string[]): CliOptions {
   const packageJson = JSON.parse(
@@ -33,25 +26,34 @@ function parseCliArgs(argv: string[]): CliOptions {
 
   const program = new Command()
     .name('hdd')
-    .usage('[options] [folder]')
-    .description('Visualize hard disk usage for a folder (defaults to the current folder).')
-    .argument('[folder]', 'folder to scan', './')
+    .usage('[options] [folder...]')
+    .description(
+      'Visualize hard disk usage for one or more folders (defaults to the current folder).',
+    )
+    .argument('[folder...]', 'folders to scan')
     .option('-p, --print', 'print a summary instead of launching the interactive UI')
     .version(packageJson.version, '-v, --version', 'print the version and exit')
     .helpOption('-h, --help', 'show usage');
 
   program.parse(argv, {from: 'user'});
-  const [folder] = program.processedArgs as [string];
-  const targetPath = resolve(folder);
+  const [folderArgs] = program.processedArgs as [string[] | undefined];
+  const folders = folderArgs?.length ? folderArgs : ['./'];
+  const targetPaths: string[] = [];
 
-  if (!isDirectory(targetPath)) {
-    console.error(`error: '${folder}' is not a folder`);
-    process.exit(-1);
+  for (const folder of folders) {
+    const targetPath = resolve(folder);
+    if (!isDirectory(targetPath)) {
+      console.error(`error: '${folder}' is not a folder`);
+      process.exit(-1);
+    }
+    if (!targetPaths.includes(targetPath)) {
+      targetPaths.push(targetPath);
+    }
   }
 
   return {
     printSummary: Boolean(program.opts().print),
-    targetPath,
+    targetPaths,
   };
 }
 
@@ -63,12 +65,17 @@ function isDirectory(path: string): boolean {
   }
 }
 
-async function printDiskUsageSummary(scanner: DiskUsageScanner): Promise<void> {
+async function printDiskUsageSummary(scanner: MultiScanner): Promise<void> {
   const progress = await scanner.wait();
-  const {directories: largestDirectories, files: largestFiles} = largestCandidates(progress, 10);
+  const {directories: largestDirectories, files: largestFiles} = progress.largest(10);
   const status = progress.isAborted ? 'Aborted' : progress.isComplete ? 'Complete' : 'Incomplete';
   const lines = [
-    `Hard disk usage report: ${progress.rootPath}`,
+    `Hard disk usage report: ${progress.roots.map(root => root.rootPath).join(', ')}`,
+    ...(progress.isMultiple
+      ? progress.roots.map(
+          (root, index) => `  ${index + 1}. ${root.rootPath} ${formatBytes(root.size)}`,
+        )
+      : []),
     `Status: ${status}`,
     `Total disk usage: ${formatBytes(progress.size)}`,
     `Scanned: ${progress.entriesScanned.toLocaleString('en-US')} entries (${progress.filesScanned.toLocaleString('en-US')} files, ${progress.directoriesScanned.toLocaleString('en-US')} directories)`,
@@ -92,7 +99,8 @@ async function printDiskUsageSummary(scanner: DiskUsageScanner): Promise<void> {
 
   console.log(lines.join('\n'));
 
-  if (progress.errors.some(error => error.path === progress.path)) {
+  // A folder that could not be scanned at all reports its error at the root.
+  if (progress.roots.some(root => root.errors.some(error => error.path === '.'))) {
     process.exitCode = 1;
   }
 }
@@ -109,9 +117,9 @@ function formatEntrySection(
     return lines;
   }
 
-  for (const [, info] of entries) {
+  for (const [path, info] of entries) {
     const suffix = info.isDirectory ? '/' : '';
-    const title = `${displayPath(info)}${suffix}`;
+    const title = `${path || info.name}${suffix}`;
     const link = info.isDirectory
       ? fileLink(info.absolutePath, title)
       : containingFolderLink(info.absolutePath, title);
@@ -119,10 +127,6 @@ function formatEntrySection(
   }
 
   return lines;
-}
-
-function displayPath(info: FileInfo): string {
-  return info.path || info.name;
 }
 
 let screen: Screen | undefined;
@@ -138,7 +142,7 @@ if (options.printSummary) {
     const [screen_] = await run(
       React.createElement(App, {
         scanner,
-        targetPath,
+        targetPaths,
         onExit() {
           scanner.abort();
           screen?.exit();
