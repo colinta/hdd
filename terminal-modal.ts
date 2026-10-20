@@ -17,6 +17,7 @@ import {
 } from '@teaui/core';
 import {registerElement} from '@teaui/react';
 import {Subprocess} from '@teaui/subprocess';
+import {userInfo} from 'node:os';
 import React from 'react';
 
 export interface TerminalModalProps extends ViewProps {
@@ -77,8 +78,10 @@ export class TerminalModal extends View {
     super({});
     this.#onClose = onClose;
 
+    const shell = loginShell();
     const subprocess = new Subprocess({
-      command: defaultShell(),
+      command: shell.command,
+      args: shell.args,
       cwd,
       onExit: () => this.#onClose(),
     });
@@ -144,11 +147,26 @@ export class TerminalModal extends View {
   }
 }
 
-function defaultShell(): string {
+/**
+ * The user's login shell (as set by `chsh`), started as an interactive login shell so that it
+ * loads the same startup files as a new terminal window (.bash_profile, .zprofile + .zshrc, …).
+ * It runs in a pty, so it is interactive without `-i`.
+ */
+function loginShell(): {command: string; args: string[]} {
   if (process.platform === 'win32') {
-    return process.env.COMSPEC || 'cmd.exe';
+    return {command: process.env.COMSPEC || 'cmd.exe', args: []};
   }
-  return process.env.SHELL || '/bin/sh';
+
+  // `userInfo().shell` comes from the user database (what `chsh` changes), whereas $SHELL can
+  // be stale or overridden by whatever launched hdd.
+  let shell: string | null = null;
+  try {
+    shell = userInfo().shell;
+  } catch {
+    // No user database entry (e.g. some containers).
+  }
+  // `-l` alone, because csh and tcsh only honor it when it is the only flag.
+  return {command: shell || process.env.SHELL || '/bin/sh', args: ['-l']};
 }
 
 registerElement('hdd-terminal-modal', (props: TerminalModalProps) => new TerminalModal(props));
