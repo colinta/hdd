@@ -18,6 +18,7 @@ import {
   readDirectoryIdentity,
   type IdentityClassification,
 } from './entry-store.js';
+import {Heap} from './heap.js';
 import {
   nodeFileSystem,
   type FileSystem,
@@ -1614,59 +1615,144 @@ export function createDiskUsageScanner(
     return (candidate.path ??= pathKeyFor(candidate.id));
   }
 
-  /**
-   * Select directories by the space they account for beyond their largest child directory.
-   * This prevents a single large subtree from occupying the list once for every ancestor,
-   * while still allowing branching ancestors to rank for the other space they contain.
-   */
   function computeLargest(limit: number): {directories: Candidate[]; files: Candidate[]} {
-    const directories: Candidate[] = [];
-    const files: Candidate[] = [];
-    let currentId = NONE;
-    let currentPath: string | null = null;
-    const pathOfCurrent = (id: number): string => {
-      if (currentId !== id) {
-        currentId = id;
-        currentPath = null;
+    const directories = computeLargestDirectories(limit);
+    // Selection uses unique sizes, but the report is ordered by total size. A selected directory
+    // is never smaller than its selected descendants, so parents are listed above their children.
+    directories.sort(
+      (a, b) => b.size - a.size || candidatePath(a).localeCompare(candidatePath(b)),
+    );
+    return {directories, files: computeLargestFiles(limit)};
+  }
+
+  /** Whether `a` ranks before `b`: larger selection size, then larger total size, then path. */
+  function ranksBefore(
+    a: Candidate,
+    b: Candidate,
+    aSelectionSize = a.selectionSize,
+    bSelectionSize = b.selectionSize,
+  ): boolean {
+    if (aSelectionSize !== bSelectionSize) {
+      return aSelectionSize > bSelectionSize;
+    }
+    if (a.size !== b.size) {
+      return a.size > b.size;
+    }
+    return candidatePath(a).localeCompare(candidatePath(b)) < 0;
+  }
+
+  function newCandidate(id: number, size: number, selectionSize: number): Candidate {
+    return {id, generation: store.generation(id), size, selectionSize, path: null};
+  }
+
+  /**
+   * Select directories top-down, in passes from the largest directory to smaller ones.
+   *
+   * Each selected directory has a selection size: the space it accounts for beyond its nearest
+   * selected descendants (`ios` minus `ios/foo` minus `ios/bar`). Starting with the top-level
+   * directories, the largest directory not yet considered is selected, its size is taken from
+   * its nearest selected ancestor, and its child directories become candidates. Whenever the
+   * selection holds more than `limit` entries, the entry with the least selection size is
+   * dropped, and that space returns to its nearest selected ancestor. A directory whose space is
+   * entirely accounted for by its selected descendants is dropped regardless of the limit.
+   *
+   * Candidates are considered from largest to smallest, so once a candidate could not outrank
+   * the least entry in a full selection, no remaining candidate could either.
+   */
+  function computeLargestDirectories(limit: number): Candidate[] {
+    const root = visibleRoot;
+    const selected = new Map<number, Candidate>();
+    // Directories to consider, largest first.
+    const pending = new Heap<Candidate>(
+      (a, b) =>
+        a.size > b.size ||
+        (a.size === b.size && candidatePath(a).localeCompare(candidatePath(b)) < 0),
+    );
+    // Selected entries, lowest ranked first. An entry goes stale when its directory is dropped
+    // or its selection size changes; the directory is pushed again with its new selection size.
+    interface Ranked {
+      candidate: Candidate;
+      selectionSize: number;
+    }
+    const lowest = new Heap<Ranked>((a, b) =>
+      ranksBefore(b.candidate, a.candidate, b.selectionSize, a.selectionSize),
+    );
+    const isCurrent = ({candidate, selectionSize}: Ranked) =>
+      selected.get(candidate.id) === candidate && candidate.selectionSize === selectionSize;
+    const rank = (candidate: Candidate) =>
+      lowest.push({candidate, selectionSize: candidate.selectionSize});
+    const peekLowest = (): Candidate | null => {
+      for (let top = lowest.peek(); top; top = lowest.peek()) {
+        if (isCurrent(top)) {
+          return top.candidate;
+        }
+        lowest.pop();
       }
-      return (currentPath ??= pathKeyFor(id));
+      return null;
     };
-    // Whether the entry ranks before `candidate`: larger selection size, then larger total
-    // size, then path order.
-    const ranksBefore = (
-      id: number,
-      size: number,
-      selectionSize: number,
-      candidate: Candidate,
-    ): boolean => {
-      if (selectionSize !== candidate.selectionSize) {
-        return selectionSize > candidate.selectionSize;
+    const nearestSelectedAncestor = (id: number): Candidate | null => {
+      for (let current = store.parent(id); current !== NONE && current !== root; ) {
+        const ancestor = selected.get(current);
+        if (ancestor) {
+          return ancestor;
+        }
+        current = store.parent(current);
       }
-      if (size !== candidate.size) {
-        return size > candidate.size;
-      }
-      return pathOfCurrent(id).localeCompare(candidatePath(candidate)) < 0;
+      return null;
     };
-    // Whether the entry belongs in a full or partial list.
-    const qualifies = (list: Candidate[], id: number, size: number, selectionSize: number) =>
-      list.length < limit || ranksBefore(id, size, selectionSize, list[limit - 1]);
-    const insert = (list: Candidate[], id: number, size: number, selectionSize: number): void => {
-      let index = 0;
-      while (index < list.length && !ranksBefore(id, size, selectionSize, list[index])) {
-        index += 1;
-      }
-      list.splice(index, 0, {
-        id,
-        generation: store.generation(id),
-        size,
-        selectionSize,
-        path: currentId === id ? currentPath : null,
-      });
-      if (list.length > limit) {
-        list.pop();
+    const addChildren = (id: number): void => {
+      for (let child = store.firstChild(id); child !== NONE; child = store.nextSibling(child)) {
+        const flags = store.flags(child);
+        const size = store.size(child);
+        if ((flags & (DIRECTORY | ALIAS)) === DIRECTORY && size > 0) {
+          pending.push(newCandidate(child, size, size));
+        }
       }
     };
 
+    addChildren(root);
+    for (let next = pending.pop(); next; next = pending.pop()) {
+      // A candidate that does not outrank the least entry survives only by displacing its
+      // nearest selected ancestor, which needs that ancestor's selection size to be less than
+      // twice the candidate's size. Remaining candidates are no larger, so none can survive.
+      const least = selected.size >= limit ? peekLowest() : null;
+      if (least && !ranksBefore(next, least) && next.size * 2 <= least.selectionSize) {
+        break;
+      }
+
+      selected.set(next.id, next);
+      rank(next);
+      const ancestor = nearestSelectedAncestor(next.id);
+      if (ancestor) {
+        ancestor.selectionSize -= next.size;
+        rank(ancestor);
+      }
+
+      for (let drop = peekLowest(); drop; drop = peekLowest()) {
+        if (selected.size <= limit && drop.selectionSize > 0) {
+          break;
+        }
+        lowest.pop();
+        selected.delete(drop.id);
+        const dropAncestor = nearestSelectedAncestor(drop.id);
+        if (dropAncestor) {
+          dropAncestor.selectionSize += drop.selectionSize;
+          rank(dropAncestor);
+        }
+      }
+
+      // A candidate dropped straight away changes nothing, and neither would its descendants:
+      // they are no larger, and its ancestor keeps more of its selection size.
+      if (selected.get(next.id) === next) {
+        addChildren(next.id);
+      }
+    }
+    return [...selected.values()];
+  }
+
+  /** The largest files, by size. */
+  function computeLargestFiles(limit: number): Candidate[] {
+    const files: Candidate[] = [];
     // Scan the entry table linearly rather than walking the tree: it is far more cache friendly,
     // and most entries are rejected by comparing sizes alone. Entries outside the visible tree
     // (a subtree kept aside for rollback) are filtered out only when they would otherwise rank.
@@ -1674,47 +1760,27 @@ export function createDiskUsageScanner(
     const end = store.idLimit;
     for (let id = 1; id < end; id++) {
       const flags = store.flags(id);
-      if (!(flags & IN_USE) || id === root) {
+      if ((flags & (IN_USE | DIRECTORY)) !== IN_USE || id === root) {
         continue;
       }
       const size = store.size(id);
-      if (!(flags & DIRECTORY)) {
-        if (
-          (files.length === limit && size < files[limit - 1].selectionSize) ||
-          !qualifies(files, id, size, size) ||
-          !isAttached(id)
-        ) {
-          continue;
-        }
-        insert(files, id, size, size);
+      if (files.length === limit && size < files[limit - 1].size) {
         continue;
       }
-      // A directory's selection size never exceeds its total size.
-      if (flags & ALIAS || (directories.length === limit && size < directories[limit - 1].selectionSize)) {
+      const candidate = newCandidate(id, size, size);
+      if ((files.length === limit && !ranksBefore(candidate, files[limit - 1])) || !isAttached(id)) {
         continue;
       }
-      let largestChildSize = 0;
-      for (let child = store.firstChild(id); child !== NONE; child = store.nextSibling(child)) {
-        const childSize = store.size(child);
-        if (childSize > largestChildSize && isDirectoryEntry(child)) {
-          largestChildSize = childSize;
-        }
+      let index = 0;
+      while (index < files.length && !ranksBefore(candidate, files[index])) {
+        index += 1;
       }
-      const selectionSize = Math.max(0, size - largestChildSize);
-      if (
-        selectionSize > 0 &&
-        qualifies(directories, id, size, selectionSize) &&
-        isAttached(id)
-      ) {
-        insert(directories, id, size, selectionSize);
+      files.splice(index, 0, candidate);
+      if (files.length > limit) {
+        files.pop();
       }
     }
-
-    // Selection uses the non-redundant size, but the report remains ordered by total size.
-    directories.sort(
-      (a, b) => b.size - a.size || candidatePath(a).localeCompare(candidatePath(b)),
-    );
-    return {directories, files};
+    return files;
   }
 
   // Tree bookkeeping
@@ -1851,9 +1917,11 @@ export function analyzeDiskUsage(
 }
 
 /**
- * The largest directories and files. Directories are selected by the space they account for
- * beyond their largest child directory, so one large subtree does not fill the list once for
- * every ancestor. While a scan runs, rankings are refreshed at most once per second.
+ * The largest directories and files. Directories are selected top-down by the space they account
+ * for beyond their selected descendants, so one large subtree does not fill the list once for
+ * every ancestor, and a parent is kept only when its remaining space earns a place of its own.
+ * Both lists are ordered by total size. While a scan runs, rankings are refreshed at most once
+ * per second.
  */
 export function largestCandidates(progress: ProgressReport, count: number): LargestCandidates {
   return progress.largest(count);

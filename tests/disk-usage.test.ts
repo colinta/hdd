@@ -846,7 +846,7 @@ describe('largest candidates', () => {
     top 2mb
   `;
 
-  it('ranks files by size and directories by space beyond their largest child', async () => {
+  it('ranks files by size and directories by space beyond their selected descendants', async () => {
     const {finish} = createTestScanner(RANKED);
     const report = await finish();
 
@@ -858,6 +858,71 @@ describe('largest candidates', () => {
 
     const two = largestCandidates(report, 2);
     expect(two.directories.map(([path]) => path)).toEqual(['a/b', 'c']);
+  });
+
+  const PROJECT = (iosOwn: string) => `
+    /android
+      /foo
+        f 80mb
+      a 5mb
+    /ios
+      /foo
+        f 30mb
+      /bar
+        f 20mb
+      i ${iosOwn}
+    /baz
+      z 10mb
+  `;
+
+  it('keeps a parent whose remaining space outranks the next directory', async () => {
+    const {finish} = createTestScanner(PROJECT('15mb'));
+    const report = await finish();
+
+    // ios accounts for 15mb beyond ios/foo and ios/bar, more than baz; android only 5mb.
+    expect(largestCandidates(report, 4).directories.map(([path]) => path)).toEqual([
+      'android/foo',
+      'ios',
+      'ios/foo',
+      'ios/bar',
+    ]);
+  });
+
+  it('drops a parent whose remaining space does not outrank the next directory', async () => {
+    const {finish} = createTestScanner(PROJECT('5mb'));
+    const report = await finish();
+
+    expect(largestCandidates(report, 4).directories.map(([path]) => path)).toEqual([
+      'android/foo',
+      'ios/foo',
+      'ios/bar',
+      'baz',
+    ]);
+  });
+
+  it('represents a large directory whose space is split among deeper directories', async () => {
+    const {finish} = createTestScanner(`
+      /ios
+        /pods
+          /a
+            f 45mb
+          /b
+            f 45mb
+        i 10mb
+      /gradle
+        /history
+          h 70mb
+      /z
+        z 50mb
+    `);
+    const report = await finish();
+
+    // No directory under ios accounts for more than 45mb beyond its largest child, but ios/pods
+    // holds 90mb that no other selected directory covers.
+    expect(largestCandidates(report, 2).directories.map(([path]) => path)).toEqual([
+      'ios/pods',
+      'gradle/history',
+    ]);
   });
 
   it('excludes the previous subtree kept aside during a refresh', async () => {

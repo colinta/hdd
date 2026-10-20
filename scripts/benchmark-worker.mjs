@@ -1,7 +1,7 @@
 // Runs one benchmark sample in a fresh process. Started by scripts/benchmark.mjs; prints one
 // `BENCH_RESULT <json>` line on stdout.
 import {monitorEventLoopDelay, performance} from 'node:perf_hooks';
-import {join, resolve} from 'node:path';
+import {join, resolve, sep} from 'node:path';
 import {pathToFileURL} from 'node:url';
 
 const RESULT_PREFIX = 'BENCH_RESULT ';
@@ -215,39 +215,26 @@ function checkConsistency(current, fullWalk) {
   return result;
 }
 
-// A brute-force reference for ProgressReport.largest: walks every entry through the public views.
-// Directories are selected by their size beyond their largest child directory; files by size.
+// A reference for ProgressReport.largest through the public views, using plain arrays.
+// Files are ranked by size. Directories are considered largest first; each selected directory is
+// credited with its size beyond its nearest selected descendants, and the least credited is
+// dropped whenever more than `count` are selected (or when it is credited with nothing).
 function checkRanking(report, count) {
-  const directories = [];
   const files = [];
   const stack = [...report.children];
   while (stack.length) {
     const info = stack.pop();
-    if (!info.isDirectory) {
+    if (info.isDirectory) {
+      stack.push(...info.children);
+    } else {
       files.push({path: info.path, size: info.size, selectionSize: info.size});
-      continue;
-    }
-    if (info.aliasOf) {
-      continue;
-    }
-    let largestChild = 0;
-    for (const child of info.children) {
-      if (child.isDirectory && child.size > largestChild) {
-        largestChild = child.size;
-      }
-      stack.push(child);
-    }
-    const selectionSize = Math.max(0, info.size - largestChild);
-    if (selectionSize > 0) {
-      directories.push({path: info.path, size: info.size, selectionSize});
     }
   }
   const bySelection = (a, b) =>
     b.selectionSize - a.selectionSize || b.size - a.size || a.path.localeCompare(b.path);
-  const expectedDirectories = directories
-    .sort(bySelection)
-    .slice(0, count)
-    .sort((a, b) => b.size - a.size || a.path.localeCompare(b.path))
+  const bySize = (a, b) => b.size - a.size || a.path.localeCompare(b.path);
+  const expectedDirectories = referenceDirectories(report, count, bySelection, bySize)
+    .sort(bySize)
     .map(entry => entry.path);
   const expectedFiles = files.sort(bySelection).slice(0, count).map(entry => entry.path);
 
@@ -259,6 +246,59 @@ function checkRanking(report, count) {
   return matches
     ? {matches}
     : {matches, expectedDirectories, actualDirectories, expectedFiles, actualFiles};
+}
+
+function referenceDirectories(report, count, bySelection, bySize) {
+  const pending = [];
+  const addChildren = info => {
+    for (const child of info.children) {
+      if (child.isDirectory && !child.aliasOf && child.size > 0) {
+        const entry = {path: child.path, size: child.size, selectionSize: child.size, info: child};
+        let index = 0;
+        while (index < pending.length && bySize(pending[index], entry) < 0) {
+          index += 1;
+        }
+        pending.splice(index, 0, entry);
+      }
+    }
+  };
+  const selected = [];
+  const least = () => selected.reduce((low, entry) => (bySelection(entry, low) > 0 ? entry : low));
+  const nearestAncestor = path =>
+    selected
+      .filter(entry => path.startsWith(entry.path + sep))
+      .reduce((near, entry) => (!near || entry.path.length > near.path.length ? entry : near), null);
+
+  addChildren(report);
+  while (pending.length) {
+    const next = pending.shift();
+    if (selected.length >= count) {
+      const low = least();
+      if (bySelection(next, low) >= 0 && next.size * 2 <= low.selectionSize) {
+        break;
+      }
+    }
+    selected.push(next);
+    const ancestor = nearestAncestor(next.path);
+    if (ancestor) {
+      ancestor.selectionSize -= next.size;
+    }
+    while (selected.length) {
+      const drop = least();
+      if (selected.length <= count && drop.selectionSize > 0) {
+        break;
+      }
+      selected.splice(selected.indexOf(drop), 1);
+      const dropAncestor = nearestAncestor(drop.path);
+      if (dropAncestor) {
+        dropAncestor.selectionSize += drop.selectionSize;
+      }
+    }
+    if (selected.includes(next)) {
+      addChildren(next.info);
+    }
+  }
+  return selected;
 }
 
 // Approximates the scanner work App.tsx does for each progress notification. Rendering itself is
