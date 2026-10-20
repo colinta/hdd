@@ -1,5 +1,5 @@
 import {existsSync} from 'node:fs';
-import React, {useEffect, useState} from 'react';
+import React, {useEffect, useRef, useState} from 'react';
 import {
   Button,
   HotKey,
@@ -16,6 +16,7 @@ import {formatBytes, formatElapsed, type FileInfo} from './disk-usage.js';
 import {type CombinedReport, type MultiScanner, type RootEntry} from './multi-scanner.js';
 import {containingFolderLink, fileLink} from './terminal-link.js';
 import {Terminal} from './terminal-modal.js';
+import {DragDivider} from './drag-separator.js';
 
 interface BuildInfo {
   version: string;
@@ -38,6 +39,8 @@ export function App({scanner, targetPaths, onExit}: AppProps) {
   const [topCount, setTopCount] = useState(10);
   const [progress, setProgress] = useState<CombinedReport>(() => scanner.getReport());
   const [terminalDir, setTerminalDir] = useState<FileInfo | null>(null);
+  // The number of entry rows shown when dragging the divider began.
+  const dragStartRows = useRef(0);
 
   function refreshReport() {
     setProgress(scanner.getReport());
@@ -161,7 +164,18 @@ export function App({scanner, targetPaths, onExit}: AppProps) {
           </Stack.down>
         </Stack.right>
 
-        <Separator direction="horizontal" border="single" />
+        {/* Dragging the divider moves it one entry row at a time. */}
+        <DragDivider
+          onDragStart={() => {
+            // Fewer entries than topCount may exist; measure from the rows actually shown,
+            // so that the divider follows the mouse immediately.
+            dragStartRows.current = Math.max(
+              1,
+              Math.min(topCount, Math.max(largestDirectories.length, largestFiles.length)),
+            );
+          }}
+          onDrag={rows => setTopCount(Math.max(1, dragStartRows.current + rows))}
+        />
 
         {progress.roots.map((root, index) => (
           <Text bold key={index}>
