@@ -17,6 +17,7 @@ import {type CombinedReport, type MultiScanner, type RootEntry} from './multi-sc
 import {containingFolderLink, fileLink} from './terminal-link.js';
 import {Terminal} from './terminal-modal.js';
 import {DragDivider} from './drag-separator.js';
+import {tildify} from './paths.js';
 
 interface BuildInfo {
   version: string;
@@ -180,7 +181,7 @@ export function App({scanner, targetPaths, onExit}: AppProps) {
         {progress.roots.map((root, index) => (
           <Text bold key={index}>
             {progress.isMultiple ? `${index + 1}. ` : ''}
-            {root.path} {formatBytes(root.size)}
+            {tildify(root.path)} {formatBytes(root.size)}
           </Text>
         ))}
         <Scrollable>

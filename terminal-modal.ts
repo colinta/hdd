@@ -19,6 +19,7 @@ import {registerElement} from '@teaui/react';
 import {Subprocess} from '@teaui/subprocess';
 import {userInfo} from 'node:os';
 import React from 'react';
+import {tildify} from './paths.js';
 
 export interface TerminalModalProps extends ViewProps {
   /** Working directory for the shell. */
@@ -114,7 +115,7 @@ export class TerminalModal extends View {
                 'flex1',
                 new Box({
                   border: 'rounded',
-                  title: ` ${cwd} `,
+                  title: ` ${tildify(cwd)} `,
                   children: [Stack.down([header, ['flex1', subprocess]])],
                 }),
               ],
